@@ -1,5 +1,4 @@
-# Sequence-to-point (seq2point) Toolkit non-intrusive load monitoring (NILM)
-
+# Sequence-to-Point (Seq2Point) Toolkit for Non-Intrusive Load Monitoring (NILM)
 
 This repository contains an implementation of Seq2Point models for Non-Intrusive Load Monitoring (NILM), based on the approach introduced in the paper:
 
@@ -8,67 +7,237 @@ Mingjun Zhong, Nigel Goddard, Stephen Sutton, and Charles Gillan (2018).
 
 The code has been adapted from the original implementation by Mingjun Zhong: https://github.com/MingjunZhong/seq2point-nilm.
 
-The project aims to provide a toolkit that standardizes benchmarking for the latest seq2point architectures across various energy datasets, providing performance metrics (mean absolute error, signal aggregate error and inference time) in an easy to compare format across multiple datasets such as REDD, REFIT, ECO and UKDALE. 
+This toolkit standardizes benchmarking for Seq2Point architectures across various energy datasets, providing performance metrics (Mean Absolute Error, Signal Aggregate Error, and Inference Time) in an easy-to-compare format across multiple datasets such as REDD, REFIT, ECO, and UKDALE.
 
+## Project Structure
 
-## Overview of Key Modules
+```
+nilm-baseline/
+├── main.py                          # Main entry point: Train/Evaluate/Fine-tune CLI
+├── data_wizard.py                   # Data engineering CLI tool
+│
+├── dataset_management/              # Data Engineering Module
+│   ├── dataset_registry.py          # Dataset registry center
+│   ├── dataset_manager.py           # Dataset manager
+│   └── data_separation/
+│       ├── data_separator.py        # Data separator
+│       └── *_appliance_mappings.json # Appliance mapping configurations for each dataset
+│
+├── model_pipeline/                  # Model Pipeline Module
+│   ├── seq2Point_model.py           # Model definitions
+│   ├── seq2Point_factory.py         # Model factory
+│   ├── data_feeder.py               # Data loading and normalization
+│   ├── train_model.py               # Trainer
+│   ├── test_model.py                # Tester
+│   └── finetune_model.py            # Fine-tuner
+│
+├── dataset/                         # Processed datasets
+│   └── UKDALE_dataset/              # Example: UKDALE processed data
+│       ├── dishwasher_H1.csv
+│       ├── fridge_H1.csv
+│       └── ...
+│
+├── result/                          # Evaluation results
+│   └── ukdale/
+│       ├── dishwasher/
+│       └── fridge/
+│
+└── saved_models/                    # Saved model weights
+```
 
-### data_separator.py
-The data separator module is designed to disaggregate appliance-specific power consumption data from multiple NILM (Non-Intrusive Load Monitoring) datasets. The currently supported datasets and their expected formats is as follows:
-- UKDALE: HDF5 file (https://data.ukedc.rl.ac.uk/cgi-bin/data_browser/browse/edc/efficiency/residential/EnergyConsumption/Domestic/UK-DALE-2017/UK-DALE-FULL-disaggregated/ukdale.h5.zip)
-- REFIT: Cleaned format (https://pureportal.strath.ac.uk/en/datasets/refit-electrical-load-measurements-cleaned)
-- REDD: .HDF5 file (https://tokhub.github.io/dbecd/links/redd.html)
-- ECO: (Requires pre-processing) Before using the ECO dataset, some preprocessing is required. The dataset is originally available as **zipped files**, where each **house** has separate ZIP archives for:
-  - **Smart meter (aggregate) data**
-  - **Plug-level appliance data** (one zip file per plug)
-  - Unzip the smart meter and plug level appliance data to a single folder (CSV version)
+## Data Paths
 
-The following code processes the data to the required format: 
+### Supported Datasets
 
-data_separator = DataSeparator(
-    file_path=*file location of the raw data*,
-    save_path=*save path for the files*,
-    appliance_name=...,
-    dataset_type=...,
-)
-data_separator.process_data()
+The toolkit supports the following NILM datasets:
 
-Running this saves the data in HDF5 format
+- **UKDALE**: HDF5 format - [Download](https://data.ukedc.rl.ac.uk/cgi-bin/data_browser/browse/edc/efficiency/residential/EnergyConsumption/Domestic/UK-DALE-2017/UK-DALE-FULL-disaggregated/ukdale.h5.zip)
+- **REFIT**: Cleaned CSV format - [Download](https://pureportal.strath.ac.uk/en/datasets/refit-electrical-load-measurements-cleaned)
+- **REDD**: HDF5 format - [Download](https://tokhub.github.io/dbecd/links/redd.html)
+- **ECO**: Requires pre-processing (unzip smart meter and plug-level data to a single folder)
 
-### dataset_manager.py
- responsible for loading, processing, and preparing appliance-specific data from NILM datasets for training Seq2Point models. It handles data selection, resampling, normalization, and saving in a structured format.
- 
-It extracts aggregate power readings and individual appliance consumption, ensuring consistent sampling intervals and selects a chunk of data with minimal gaps and sufficient appliance activity. 
+### Data Processing Pipeline
 
-Saves the data for a specified appliance in a dataset as a csv with filename: [appliance]_H[house number].csv
+1. **Raw Data** → `DataSeparator` → **Separated HDF5 files**
+2. **Separated Data** → `DatasetManager` → **Training-ready CSV files**
 
-Also creates a normalisation parameters .json file containing the aggregate and appliance mean and standard deviation 
+### Processed Data Format
 
-Example CSV file from UKDALE dataset (dishwasher_H1.csv):
-  time, aggregate, dishwasher
-  2013-05-17 09:35:12, 0.13711391113313803, -0.07084559614012528
-  2013-05-17 09:35:18, 0.134153645793339, -0.07084559614012528
-  2013-05-17 09:35:24, 0.1430344418127361, -0.07084559614012528
-  2013-05-17 09:35:30, 0.1430344418127361, -0.07084559614012528
+After processing, each appliance dataset is saved as a CSV file with the following format:
 
-### train_model.py 
+```csv
+time, aggregate, <appliance_name>
+2013-05-17 09:35:12, 0.13711391113313803, -0.07084559614012528
+2013-05-17 09:35:18, 0.134153645793339, -0.07084559614012528
+2013-05-17 09:35:24, 0.1430344418127361, -0.07084559614012528
+```
 
-The module for training a seq2point model. Class parameters are as follows:
-model_name, train_csv_dirs, validation_csv_dirs, appliance, dataset, model_save_dir, window_length 
-  model_name (str): Name of the model to train.
-  train_csv_dirs (list): List of file paths to the training CSVs.
-  validation_csv_dirs (list): list of file paths to the validation CSVs
-  appliance (str): Name of the appliance to train the model for.
-  dataset (str): Name of the dataset.
-  model_save_dir (str): Directory to save the trained model.
-  window_length (int): Length of the input window.
+File naming convention: `<appliance>_H<house_number>.csv` (e.g., `dishwasher_H1.csv`)
 
-### test_model.py 
+## Usage
 
-The module for training seq2point models. Class parameters are as follows:
-        model_name (str): Name of the model to test.
-        model_state_dir (str): Directory to load the model state from.
-        test_csv_dir (str): Directory to load the test CSV from.
-        appliance (str): Name of the appliance to test the model for.
-        normalisation_parameters_dir (str): Directory to load the normalisation parameters from.
+### 1. Data Engineering (data_wizard.py)
+
+Run the data engineering CLI tool:
+
+```bash
+python data_wizard.py
+```
+
+**Options:**
+
+1. **Run Data Separator** - Separate raw data into appliance-specific HDF5 files
+2. **Run Dataset Manager** - Convert separated data to training-ready CSV format
+
+**Data Separator Parameters:**
+
+- File path to raw data
+- Save path for separated data
+- Dataset type (UKDALE, REDD, REFIT, ECO)
+- Appliance name (optional, processes all if not specified)
+- Maximum number of houses to process
+
+**Dataset Manager Parameters:**
+
+- Path to separated data
+- Save path for processed CSVs
+- Dataset type
+- Appliance name
+- Debug mode (y/n)
+- Maximum number of houses
+- Maximum number of rows
+
+### 2. Model Training/Evaluation/Fine-tuning (main.py)
+
+Run the main CLI:
+
+```bash
+python main.py
+```
+
+**Menu Options:**
+
+1. **Train a model** - Train a new Seq2Point model
+2. **Evaluate a model** - Test a trained model
+3. **Fine-tune a model** - Fine-tune an existing model
+4. **Exit**
+
+#### Training a Model
+
+When selecting "Train a model", you will be prompted to:
+
+1. Select training CSV files (via file dialog or manual input)
+2. Enter appliance name (e.g., dishwasher, fridge, kettle)
+3. Enter dataset name (e.g., UKDALE, REDD)
+4. Select model architecture:
+   - Original Seq2Point
+   - Balanced Seq2Point
+   - Dropout-Reduced Seq2Point
+   - LSTM-Based Seq2Point
+5. Set hyperparameters:
+   - Input window length (default: 599)
+   - Number of epochs (default: 10)
+   - Validation ratio (default: 0.2)
+   - Random seed (default: 42)
+
+**Output:**
+
+- Trained model saved to `saved_models/` directory
+- Loss plots generated
+
+#### Evaluating a Model
+
+When selecting "Evaluate a model", you will be prompted to:
+
+1. Select test CSV file
+2. Select trained model file (.pth)
+3. Enter dataset name
+
+**Output:**
+
+- Performance metrics:
+  - MAE (Mean Absolute Error) in Watts
+  - SAE (Signal Aggregate Error)
+  - Inference time in seconds
+- Prediction plots
+- Results saved to `result/<dataset>/<appliance>/`
+
+#### Fine-tuning a Model
+
+When selecting "Fine-tune a model", you will be prompted to:
+
+1. Select fine-tuning CSV file
+2. Select pre-trained model file (.pth)
+3. Enter dataset name
+4. Set maximum epochs (default: 50)
+5. Set random seed (default: 42)
+
+**Output:**
+
+- Fine-tuned model saved to `saved_models/`
+- Loss plots generated
+
+## Module Documentation
+
+### dataset_management/
+
+#### dataset_registry.py
+
+Central registry for supported datasets and their configurations.
+
+#### dataset_manager.py
+
+Loads, processes, and prepares appliance-specific data for training:
+
+- Data selection and resampling
+- Normalization
+- Gap detection and data quality filtering
+- CSV file generation
+
+#### data_separator.py
+
+Disaggregates appliance-specific power consumption from raw NILM datasets:
+
+- Supports UKDALE, REFIT, REDD, ECO formats
+- Outputs HDF5 files
+
+### model_pipeline/
+
+#### seq2Point_model.py
+
+Neural network model definitions for Seq2Point architectures.
+
+#### seq2Point_factory.py
+
+Factory class for creating different Seq2Point model variants.
+
+#### data_feeder.py
+
+Handles data loading, batching, and normalization for training/testing.
+
+#### train_model.py
+
+Training pipeline with:
+
+- Configurable hyperparameters
+- Validation split
+- Loss tracking and plotting
+
+#### test_model.py
+
+Evaluation pipeline with:
+
+- Model inference
+- Metric calculation (MAE, SAE, inference time)
+- Result visualization
+
+#### finetune_model.py
+
+Fine-tuning pipeline for adapting pre-trained models to new data.
+
+## Performance Metrics
+
+- **MAE (Mean Absolute Error)**: Average absolute difference between predicted and actual power consumption (Watts)
+- **SAE (Signal Aggregate Error)**: Relative error in total energy consumption
+- **Inference Time**: Time taken to generate predictions (seconds)
 
