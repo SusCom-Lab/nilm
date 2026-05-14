@@ -10,9 +10,6 @@ The code has been adapted from the original implementation by Mingjun Zhong: htt
 
 The project aims to provide a toolkit that standardizes benchmarking for the latest seq2point architectures across various energy datasets, providing performance metrics (mean absolute error, signal aggregate error and inference time) in an easy to compare format across multiple datasets such as REDD, REFIT, ECO and UKDALE. 
 
-The screencast for this project can be found at: https://drive.google.com/file/d/1ezrZ0ZRwcAXschUksiEwhoXpm7u02jFQ/view?usp=sharing
-
-Full Paper submitted to IEEE ISGT Europe 2025: https://drive.google.com/file/d/1mWyYo44-GbeLIskfP2HE7b7Xm2kzcPjx/view?usp=sharing
 
 ## Overview of Key Modules
 
