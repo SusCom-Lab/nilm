@@ -1,0 +1,7 @@
+# 忽略所有模型文件
+saved_models/
+*.pth
+*.pt
+# 忽略缓存/日志
+__pycache__/
+*.pyc

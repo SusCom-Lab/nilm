@@ -1,0 +1,2 @@
+appliance,model,dataset,MAE,SAE,inference_time
+fridge,LSTM-Based Seq2Point,ukdale,17.303812718694886,0.04174215138131311,30.49645686149597

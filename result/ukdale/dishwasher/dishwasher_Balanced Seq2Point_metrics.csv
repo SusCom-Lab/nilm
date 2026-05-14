@@ -1,0 +1,2 @@
+appliance,model,dataset,MAE,SAE,inference_time
+dishwasher,Balanced Seq2Point,ukdale,16.70275645440564,0.004750326331938585,7.241219997406006

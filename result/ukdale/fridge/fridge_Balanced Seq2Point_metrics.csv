@@ -1,0 +1,2 @@
+appliance,model,dataset,MAE,SAE,inference_time
+fridge,Balanced Seq2Point,ukdale,17.958112822505488,0.0771693366774842,6.779534339904785

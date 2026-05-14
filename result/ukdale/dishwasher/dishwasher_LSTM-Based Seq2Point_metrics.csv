@@ -1,0 +1,2 @@
+appliance,model,dataset,MAE,SAE,inference_time
+dishwasher,LSTM-Based Seq2Point,ukdale,18.515329448835356,0.24280795893504348,33.873759508132935

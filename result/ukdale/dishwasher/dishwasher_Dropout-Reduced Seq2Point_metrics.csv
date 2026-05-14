@@ -1,0 +1,2 @@
+appliance,model,dataset,MAE,SAE,inference_time
+dishwasher,Dropout-Reduced Seq2Point,ukdale,21.790453715910637,0.1762280386286975,10.906366348266602

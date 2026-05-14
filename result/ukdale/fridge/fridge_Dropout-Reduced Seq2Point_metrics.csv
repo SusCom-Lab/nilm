@@ -1,0 +1,2 @@
+appliance,model,dataset,MAE,SAE,inference_time
+fridge,Dropout-Reduced Seq2Point,ukdale,20.81394524903039,0.01247936806016259,8.856830835342407
