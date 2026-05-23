@@ -1,0 +1,13 @@
+硬件:VIDIA RTX A6000 , NVIDIA-SMI 575.51.03 ,Driver Version: 575.51.03 ,CUDA Version: 12.9 
+torch>=2.5.0
+torchvision>=0.15.0
+torchaudio>=2.5.0
+pandas>=1.5.0
+numpy>=1.23.0
+scipy>=1.13.0
+tables>=3.8.0
+h5py>=3.8.0
+matplotlib>=3.6.0
+scikit-learn>=1.2.0
+ipython>=8.0.0
+cvxpy>=1.7.0

@@ -1,16 +1,19 @@
-from model_pipeline.data_feeder import SlidingWindowDataset
-import torch
-from torch.utils.data import DataLoader
+from __future__ import annotations
+
 import os
-import json
-import pandas as pd
-from model_pipeline.seq2Point_factory import Seq2PointFactory
+import random
+from typing import Any
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
 import torch.nn as nn
 import torch.optim as optim
-import matplotlib.pyplot as plt
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-import random
-import numpy as np
+from torch.utils.data import DataLoader
+
+from model_pipeline.data_feeder import SlidingWindowDataset
+from model_pipeline.model_registry import create_model
 
 
 def set_random_seed(seed=42):
@@ -29,139 +32,274 @@ def get_worker_init_fn(seed=42):
         worker_seed = seed + worker_id
         np.random.seed(worker_seed)
         random.seed(worker_seed)
+
     return worker_init_fn
 
 
+def mean_absolute_error(predictions, ground_truth):
+    predictions = np.asarray(predictions, dtype=np.float32)
+    ground_truth = np.asarray(ground_truth, dtype=np.float32)
+    return float(np.mean(np.abs(predictions - ground_truth)))
+
+
+def signal_aggregate_error(predictions, ground_truth, eps=1e-8):
+    predictions = np.asarray(predictions, dtype=np.float32)
+    ground_truth = np.asarray(ground_truth, dtype=np.float32)
+    denominator = max(float(np.sum(np.abs(ground_truth))), eps)
+    return float(np.abs(np.sum(predictions) - np.sum(ground_truth)) / denominator)
+
+
+def compute_metrics(predictions, ground_truth):
+    return {
+        "MAE": mean_absolute_error(predictions, ground_truth),
+        "SAE": signal_aggregate_error(predictions, ground_truth),
+    }
+
+
+def build_windowed_loaders(
+    csv_paths,
+    *,
+    window_size,
+    target_mode,
+    output_size,
+    output_offset,
+    batch_size=256,
+    val_ratio=0.2,
+    seed=42,
+):
+    train_split_ratio = 1 - val_ratio
+    train_dataset = SlidingWindowDataset(
+        csv_paths,
+        window_size,
+        split_ratio=train_split_ratio,
+        split_mode="train",
+        target_mode=target_mode,
+        output_size=output_size,
+        output_offset=output_offset,
+    )
+    validation_dataset = SlidingWindowDataset(
+        csv_paths,
+        window_size,
+        split_ratio=train_split_ratio,
+        split_mode="val",
+        target_mode=target_mode,
+        output_size=output_size,
+        output_offset=output_offset,
+    )
+
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=generator,
+        worker_init_fn=get_worker_init_fn(seed),
+    )
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        worker_init_fn=get_worker_init_fn(seed),
+    )
+    return train_loader, validation_loader
+
+
 class Trainer:
-    def __init__(self, model_name, train_csv_dirs, appliance, dataset, model_save_dir, window_length=599, val_ratio=0.2, result_dir=None, seed=42):
-        """
-        Trainer class for training Seq2Point models.
-        model_name (str): Name of the model to train.
-        train_csv_dirs (list): List of file paths to the training CSVs.
-        appliance (str): Name of the appliance to train the model for.
-        dataset (str): Name of the dataset.
-        model_save_dir (str): Directory to save the trained model.
-        window_length (int): Length of the input window.
-        val_ratio (float): Ratio of validation set split from training data (default 0.2 = 20%).
-        result_dir (str): Directory to save results (default: result/{dataset}/).
-        seed (int): Random seed for reproducibility (default: 42).
-        """
+    def __init__(
+        self,
+        model=None,
+        train_loader=None,
+        validation_loader=None,
+        optimizer=None,
+        criterion=None,
+        *,
+        model_name=None,
+        train_csv_dirs=None,
+        appliance=None,
+        dataset=None,
+        model_save_dir=None,
+        window_length=599,
+        val_ratio=0.2,
+        result_dir=None,
+        seed=42,
+        batch_size=256,
+        device=None,
+        model_init_kwargs=None,
+    ):
         set_random_seed(seed)
-        
-        self.model_name = model_name
-        self.model = Seq2PointFactory.createModel(self.model_name, window_length)
+        model_init_kwargs = dict(model_init_kwargs or {})
 
-        self.appliance = appliance
+        if model is None:
+            if model_name is None:
+                raise ValueError("Provide either a model instance or model_name.")
+            model_init_kwargs.setdefault("window_size", window_length)
+            model = create_model(model_name, **model_init_kwargs)
+
+        self.model = model
+        self.model_name = getattr(model, "display_name", model.__class__.__name__)
+        self.appliance = appliance or "appliance"
         self.appliance_name_formatted = self.appliance.replace(" ", "_")
-        self.dataset = dataset
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model.to(self.device)
+        self.dataset = dataset or "unknown"
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_size = batch_size
+        self.seed = seed
 
-        self.model_save_dir = model_save_dir
-        
-        if result_dir is None:
-            self.result_dir = os.path.join("result", dataset.lower(), self.appliance_name_formatted)
-        else:
-            self.result_dir = os.path.join(result_dir, dataset.lower(), self.appliance_name_formatted)
+        if getattr(self.model, "supports_gradient", False):
+            self.model.to(self.device)
+
+        if train_loader is None and train_csv_dirs is not None:
+            train_loader, validation_loader = build_windowed_loaders(
+                train_csv_dirs,
+                window_size=self.model.get_window_size(),
+                target_mode=self.model.get_target_type(),
+                output_size=self.model.get_output_size(),
+                output_offset=self.model.get_output_offset(),
+                batch_size=batch_size,
+                val_ratio=val_ratio,
+                seed=seed,
+            )
+
+        self.train_loader = train_loader
+        self.validation_loader = validation_loader
+        self.model_save_dir = model_save_dir or os.path.join(os.getcwd(), "saved_models")
+        self.result_dir = result_dir or os.path.join("result", self.dataset.lower(), self.appliance_name_formatted)
         os.makedirs(self.result_dir, exist_ok=True)
+        os.makedirs(self.model_save_dir, exist_ok=True)
 
-        self.criterion = nn.MSELoss()
-        beta_1 = 0.9
-        beta_2 = 0.999
-        learning_rate = 0.001
-        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, betas=(beta_1, beta_2))
-        
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', patience=2, factor=0.1)
-
-        self.batch_size = 256
-        train_split_ratio = 1 - val_ratio
-        train_dataset = SlidingWindowDataset(train_csv_dirs, self.model.getWindowSize(), split_ratio=train_split_ratio, split_mode='train')
-        validation_dataset = SlidingWindowDataset(train_csv_dirs, self.model.getWindowSize(), split_ratio=train_split_ratio, split_mode='val')
-        
-        self.generator = torch.Generator()
-        self.generator.manual_seed(seed)
-        
-        self.train_loader = DataLoader(
-            train_dataset, 
-            batch_size=self.batch_size, 
-            shuffle=True,
-            generator=self.generator,
-            worker_init_fn=get_worker_init_fn(seed)
-        )
-        self.validation_loader = DataLoader(
-            validation_dataset, 
-            batch_size=self.batch_size, 
-            shuffle=False,
-            worker_init_fn=get_worker_init_fn(seed)
-        )
+        self.criterion = criterion or nn.MSELoss()
+        if getattr(self.model, "supports_gradient", False):
+            self.optimizer = optimizer or optim.Adam(self.model.parameters(), lr=0.001, betas=(0.9, 0.999))
+            self.scheduler = ReduceLROnPlateau(self.optimizer, mode="min", factor=0.5, patience=2, threshold=1e-4)
+        else:
+            self.optimizer = optimizer
+            self.scheduler = None
 
         self.patience = 8
         self.best_val_loss = float("inf")
         self.min_delta = 1e-4
         self.counter = 0
-        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=2, threshold=self.min_delta)
-
         self.train_losses = []
         self.val_losses = []
 
+    def _prepare_torch_batch(self, inputs, targets):
+        inputs = inputs.to(self.device)
+        targets = self.model.prepare_targets(targets.to(self.device))
+        return inputs, targets
+
+    def _torch_loss(self, inputs, targets):
+        outputs = self.model(inputs)
+        outputs = self.model.prepare_outputs(outputs)
+        return self.criterion(outputs, targets)
+
+    def _collect_numpy_loader(self, loader):
+        all_inputs = []
+        all_targets = []
+        for inputs, targets in loader:
+            all_inputs.append(inputs.detach().cpu().numpy())
+            all_targets.append(self.model.prepare_targets(targets.detach().cpu().numpy()))
+        return np.concatenate(all_inputs, axis=0), np.concatenate(all_targets, axis=0)
+
+    def _save_checkpoint(self):
+        checkpoint = {
+            "model_name": self.model_name,
+            "model_key": getattr(self.model, "_registry_key", self.model_name),
+            "window_length": self.model.get_window_size(),
+            "output_size": self.model.get_output_size(),
+            "output_offset": self.model.get_output_offset(),
+            "target_type": self.model.get_target_type(),
+            "appliance": self.appliance_name_formatted,
+            "dataset": self.dataset,
+            "init_kwargs": self.model.get_init_kwargs(),
+            "model_state": self.model.export_state(),
+        }
+        if getattr(self.model, "supports_gradient", False):
+            checkpoint["model_state_dict"] = checkpoint["model_state"]
+
+        path = os.path.join(self.model_save_dir, f"{self.appliance}_{self.dataset}_{self.model_name}.pth")
+        torch.save(checkpoint, path)
+        return path
+
     def trainModel(self, num_epochs=10):
+        if self.train_loader is None:
+            raise ValueError("Trainer requires a train_loader or train_csv_dirs.")
+
+        if not getattr(self.model, "supports_gradient", False):
+            train_inputs, train_targets = self._collect_numpy_loader(self.train_loader)
+            self.model.fit(train_inputs, train_targets)
+            train_predictions = self.model.prepare_outputs(self.model.disaggregate(train_inputs))
+            train_loss = float(self.criterion(
+                torch.as_tensor(train_predictions),
+                torch.as_tensor(train_targets),
+            ).item())
+            self.train_losses.append(train_loss)
+
+            val_loss = train_loss
+            if self.validation_loader is not None and len(self.validation_loader) > 0:
+                val_inputs, val_targets = self._collect_numpy_loader(self.validation_loader)
+                val_predictions = self.model.prepare_outputs(self.model.disaggregate(val_inputs))
+                val_loss = float(self.criterion(
+                    torch.as_tensor(val_predictions),
+                    torch.as_tensor(val_targets),
+                ).item())
+            self.val_losses.append(val_loss)
+            self.best_val_loss = val_loss
+            checkpoint_path = self._save_checkpoint()
+            print(f"Classical model fitted. Checkpoint saved to {checkpoint_path}")
+            return
+
         for epoch in range(num_epochs):
             self.model.train()
-            train_loss = 0
+            train_loss = 0.0
             for inputs, targets in self.train_loader:
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                inputs, targets = self._prepare_torch_batch(inputs, targets)
                 self.optimizer.zero_grad()
-                outputs = self.model(inputs)
-                loss = self.criterion(outputs.squeeze(-1), targets)
+                loss = self._torch_loss(inputs, targets)
                 loss.backward()
                 self.optimizer.step()
                 train_loss += loss.item()
 
-            self.model.eval()
-            val_loss = 0
-            with torch.no_grad():
-                for inputs, targets in self.validation_loader:
-                    inputs, targets = inputs.to(self.device), targets.to(self.device)
-                    outputs = self.model(inputs)
-                    loss = self.criterion(outputs.squeeze(-1), targets)
-                    val_loss += loss.item()
+            train_loss /= max(1, len(self.train_loader))
 
-            train_loss /= len(self.train_loader)
-            val_loss /= len(self.validation_loader)
-            print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss}, Val Loss: {val_loss}")
+            val_loss = train_loss
+            if self.validation_loader is not None:
+                self.model.eval()
+                val_loss = 0.0
+                with torch.no_grad():
+                    for inputs, targets in self.validation_loader:
+                        inputs, targets = self._prepare_torch_batch(inputs, targets)
+                        val_loss += self._torch_loss(inputs, targets).item()
+                val_loss /= max(1, len(self.validation_loader))
 
-            self.scheduler.step(val_loss)
-
-            if val_loss < self.best_val_loss - self.min_delta:
-                print(f"Validation loss improved from {self.best_val_loss} to {val_loss}. Saving model...")
-                self.best_val_loss = val_loss
-                if not os.path.exists(self.model_save_dir):
-                    os.makedirs(self.model_save_dir)
-                torch.save({
-                    'model_state_dict': self.model.state_dict(),
-                    'model_name' : self.model_name,
-                    'window_length' : self.model.getWindowSize(),
-                    'appliance' : self.appliance_name_formatted
-                }, os.path.join(self.model_save_dir, f"{self.appliance}_{self.dataset}_{self.model_name}.pth"))
-                self.counter = 0
-            else:
-                self.counter += 1
-                if self.counter >= self.patience:
-                    print(f"Early stopping triggered. No improvement in validation loss for {self.patience} epochs.")
-                    break
+            print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss}, Val Loss: {val_loss}")
 
             self.train_losses.append(train_loss)
             self.val_losses.append(val_loss)
             self.scheduler.step(val_loss)
 
+            if val_loss < self.best_val_loss - self.min_delta:
+                self.best_val_loss = val_loss
+                checkpoint_path = self._save_checkpoint()
+                print(f"Validation improved. Checkpoint saved to {checkpoint_path}")
+                self.counter = 0
+            else:
+                self.counter += 1
+                if self.counter >= self.patience:
+                    print(f"Early stopping triggered after {epoch + 1} epochs.")
+                    break
+
     def plotLosses(self):
+        if not self.train_losses:
+            return
         plt.plot(self.train_losses, label="Train Loss")
-        plt.plot(self.val_losses, label="Validation Loss")
+        if self.val_losses:
+            plt.plot(self.val_losses, label="Validation Loss")
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
         plt.legend()
-        plt.title(f"Training and Validation Loss for {self.appliance_name_formatted} on {self.dataset} using {self.model_name}")
-        plot_filename = f'{self.appliance_name_formatted}_{self.dataset}_{self.model_name}_loss.png'
+        plt.title(f"Loss for {self.appliance_name_formatted} on {self.dataset} using {self.model_name}")
+        plot_filename = f"{self.appliance_name_formatted}_{self.dataset}_{self.model_name}_loss.png"
         plot_path = os.path.join(self.result_dir, plot_filename)
         plt.savefig(plot_path)
         plt.close()

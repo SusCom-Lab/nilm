@@ -2,6 +2,9 @@
 saved_models/
 *.pth
 *.pt
+# 忽略结果文件
+results/
+*.csv
 # 忽略缓存/日志
 __pycache__/
 *.pyc

@@ -6,8 +6,6 @@ import os
 import json
 
 
-
-
 def runDataSeparator():
     print("Data Separator")
 

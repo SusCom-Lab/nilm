@@ -1,8 +1,9 @@
 # main.py
+import json
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-from model_pipeline import seq2Point_factory, train_model, test_model, finetune_model
+from model_pipeline import finetune_model, get_model_entry, list_models, train_model, test_model
 from IPython import get_ipython
 
 
@@ -132,11 +133,59 @@ def selectModelFile(using_colab: bool):
         return path or None
 
 
+def _safe_int_input(prompt: str, default: int) -> int:
+    value = input(f"{prompt} (default {default}): ").strip()
+    return int(value) if value else default
+
+
+def _safe_float_input(prompt: str, default: float) -> float:
+    value = input(f"{prompt} (default {default}): ").strip()
+    return float(value) if value else default
+
+
+def promptModelSelection():
+    available_models = list_models()
+    numbered_models = {str(i + 1): model_name for i, model_name in enumerate(available_models)}
+
+    print("Available NILM models:")
+    for num, model_name in numbered_models.items():
+        entry = get_model_entry(model_name)
+        default_window = getattr(entry.cls, "default_window_size", "n/a")
+        print(
+            f"  {num}: {entry.display_name} "
+            f"[family={entry.family}, target={entry.target_type}, default_window={default_window}]"
+        )
+
+    model_num = input("Select a model by number: ").strip()
+    if model_num not in numbered_models:
+        raise ValueError("Invalid model selection.")
+    return numbered_models[model_num]
+
+
+def promptModelConfig(model_name: str):
+    entry = get_model_entry(model_name)
+    default_window = getattr(entry.cls, "default_window_size", 599)
+    window_size = _safe_int_input("Input window size", default_window)
+    raw_kwargs = input(
+        "Model init kwargs as JSON dict, or press Enter for defaults "
+        '(example: {"hidden_size": 256, "num_layers": 3}): '
+    ).strip()
+    model_init_kwargs = {}
+    if raw_kwargs:
+        parsed = json.loads(raw_kwargs)
+        if not isinstance(parsed, dict):
+            raise ValueError("Model init kwargs must be a JSON object.")
+        model_init_kwargs = parsed
+
+    model_init_kwargs.pop("window_size", None)
+    return window_size, model_init_kwargs
+
+
 # ---------------------------------------------------------------------
 # CLI wrappers
 # ---------------------------------------------------------------------
 def trainModelCLI():
-    print("Training a Seq2Point model ...")
+    print("Training a NILM baseline ...")
     using_colab = runningColab()
 
     train_csv_dirs = selectCSVFiles("train", using_colab)
@@ -148,24 +197,17 @@ def trainModelCLI():
     appliance = input("Enter the appliance name: ")
     dataset = input("Enter the dataset name: ")
 
-    available_models = seq2Point_factory.Seq2PointFactory.getModelMappings()
-    numbered_models = {str(i + 1): m for i, m in enumerate(available_models)}
-
     model_save_dir = "/content" if using_colab else os.path.join(os.getcwd(), "saved_models")
     os.makedirs(model_save_dir, exist_ok=True)
 
-    print("Available models:")
-    for num, model in numbered_models.items():
-        print(f"  {num}: {model}")
-
-    model_num = input("Select a model by number: ")
-    input_window_length = int(input("Input window length (default 599): ") or 599)
-    num_epochs = int(input("Number of epochs (default 10): ") or 10)
-    val_ratio = float(input("Validation ratio (default 0.2 for 20% validation): ") or 0.2)
-    seed = int(input("Random seed (default 42): ") or 42)
+    model_name = promptModelSelection()
+    input_window_length, model_init_kwargs = promptModelConfig(model_name)
+    num_epochs = _safe_int_input("Number of epochs", 10)
+    val_ratio = _safe_float_input("Validation ratio", 0.2)
+    seed = _safe_int_input("Random seed", 42)
 
     trainer = train_model.Trainer(
-        model_name=numbered_models[model_num],
+        model_name=model_name,
         train_csv_dirs=train_csv_dirs,
         appliance=appliance,
         dataset=dataset,
@@ -173,6 +215,7 @@ def trainModelCLI():
         window_length=input_window_length,
         val_ratio=val_ratio,
         seed=seed,
+        model_init_kwargs=model_init_kwargs,
     )
     trainer.trainModel(num_epochs)
     trainer.plotLosses()
@@ -180,7 +223,7 @@ def trainModelCLI():
 
 
 def evaluateModelCLI():
-    print("Evaluating a Seq2Point model ...")
+    print("Evaluating a NILM baseline ...")
     using_colab = runningColab()
 
     test_csv_dirs = selectCSVFiles("test", using_colab, single_file=True)
@@ -212,7 +255,7 @@ def evaluateModelCLI():
 
 
 def fineTuneModelCLI():
-    print("Fine‑tuning a Seq2Point model ...")
+    print("Fine‑tuning a NILM baseline ...")
     using_colab = runningColab()
 
     finetune_csv_dirs = selectCSVFiles("finetune", using_colab, single_file=True)
@@ -250,10 +293,10 @@ def fineTuneModelCLI():
 # ---------------------------------------------------------------------
 def main():
     MENU = (
-        "Welcome to the Seq2Point Model Training and Evaluation!\n"
+        "Welcome to the NILM Training and Evaluation CLI.\n"
         "1. Train a model\n"
         "2. Evaluate a model\n"
-        "3. Fine‑tune a model\n"
+        "3. Fine-tune a model\n"
         "4. Exit"
     )
     while True:

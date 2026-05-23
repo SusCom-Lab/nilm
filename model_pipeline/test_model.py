@@ -1,261 +1,281 @@
-from model_pipeline.data_feeder import SlidingWindowDataset
-import torch
-from torch.utils.data import DataLoader
-import pandas as pd
-import numpy as np
-from model_pipeline.seq2Point_factory import Seq2PointFactory
-import torch.nn as nn
-import matplotlib.pyplot as plt
-import os
-import re
+from __future__ import annotations
+
 import json
-import time 
+import os
+import time
 
-class Tester:
-    def __init__(self, model_state_dir, test_csv_dir, dataset=None, result_dir=None):
-        """
-        Tester class for testing the model
-        model_name (str): Name of the model to test.
-        model_state_dir (str): Directory to load the model state from.
-        test_csv_dir (str): Directory to load the test CSV from.
-        dataset (str): Name of the dataset (e.g., 'redd', 'ukdale').
-        result_dir (str): Directory to save results (default: result/{dataset}/{appliance}/).
-        """
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from model_pipeline.data_feeder import SlidingWindowDataset, reconstruct_series_from_windows
+from model_pipeline.model_registry import instantiate_from_checkpoint, load_checkpoint
+from model_pipeline.train_model import compute_metrics
+
+
+class Evaluator:
+    def __init__(
+        self,
+        model=None,
+        test_loader=None,
+        *,
+        model_state_dir=None,
+        test_csv_dir=None,
+        dataset=None,
+        result_dir=None,
+        batch_size=1000,
+        device=None,
+        normalisation_params=None,
+        timestamps=None,
+        aggregate_series=None,
+        target_series=None,
+    ):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.criterion = nn.MSELoss()
-        
-        if dataset is None:
-            self.dataset = "unknown"
-        else:
-            self.dataset = dataset.lower()
+        self.dataset = (dataset or "unknown").lower()
 
-        checkpoint = torch.load(model_state_dir, map_location=self.device)
-        self.model_name = checkpoint['model_name']
-        window_length = checkpoint['window_length']
-        self.model = Seq2PointFactory.createModel(self.model_name, window_length)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.to(self.device)
+        checkpoint = None
+        if model_state_dir is not None:
+            checkpoint = load_checkpoint(model_state_dir, map_location=self.device)
+            model = instantiate_from_checkpoint(checkpoint, map_location=self.device)
+        if model is None:
+            raise ValueError("Evaluator requires a model instance or model_state_dir.")
 
-        self.appliance_name_formatted = checkpoint['appliance']
+        self.model = model
+        self.model_name = getattr(model, "display_name", model.__class__.__name__)
+        self.appliance_name_formatted = (checkpoint or {}).get("appliance", "appliance")
 
-        if result_dir is None:
-            self.result_dir = os.path.join("result", self.dataset, self.appliance_name_formatted)
-        else:
-            self.result_dir = os.path.join(result_dir, self.dataset, self.appliance_name_formatted)
+        self.result_dir = result_dir or os.path.join("result", self.dataset, self.appliance_name_formatted)
         os.makedirs(self.result_dir, exist_ok=True)
 
-        self.batch_size = 1000
-        self.offset = int((0.5 * window_length) - 1)
-        test_dataset = SlidingWindowDataset([test_csv_dir], self.model.getWindowSize())
-        self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
+        self.batch_size = batch_size
+        self.test_csv_dir = test_csv_dir
+        self.normalisation_params = normalisation_params
+        self.raw_timestamps = None if timestamps is None else pd.Series(timestamps).reset_index(drop=True)
+        self.raw_aggregate = None if aggregate_series is None else np.asarray(aggregate_series, dtype=np.float32)
+        self.raw_target = None if target_series is None else np.asarray(target_series, dtype=np.float32)
 
-        normalisation_params = test_dataset.getNormalisationParams(test_csv_dir)
-        self.aggregate_mean = normalisation_params["aggregate_mean"]
-        self.aggregate_std = normalisation_params["aggregate_std"]
-        self.appliance_mean = normalisation_params["appliance_mean"]
-        self.appliance_std = normalisation_params["appliance_std"]
+        if test_loader is None and test_csv_dir is not None:
+            test_dataset = SlidingWindowDataset(
+                [test_csv_dir],
+                self.model.get_window_size(),
+                target_mode=self.model.get_target_type(),
+                output_size=self.model.get_output_size(),
+                output_offset=self.model.get_output_offset(),
+            )
+            test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
+            self.normalisation_params = test_dataset.getNormalisationParams(test_csv_dir)
 
-        test_df = pd.read_csv(test_csv_dir, low_memory=False)
-        self.dt = 0
-        self.timestamps = test_df["time"].iloc[self.offset:-self.offset].reset_index(drop=True)
+        self.test_loader = test_loader
+        if getattr(self.model, "supports_gradient", False):
+            self.model.to(self.device)
+
+        self.dt = 0.0
         self.predictions = []
         self.ground_truth = []
         self.aggregate = []
+        self.timestamps = pd.Series(dtype=object)
+
+    def _run_batch(self, inputs, targets):
+        if getattr(self.model, "supports_gradient", False):
+            inputs = inputs.to(self.device)
+            targets = self.model.prepare_targets(targets.to(self.device))
+            outputs = self.model.prepare_outputs(self.model(inputs))
+            loss = self.criterion(outputs, targets).item()
+            predictions = outputs.detach().cpu().numpy()
+            targets_np = targets.detach().cpu().numpy()
+            return predictions, targets_np, loss
+
+        inputs_np = inputs.detach().cpu().numpy()
+        targets_np = self.model.prepare_targets(targets.detach().cpu().numpy())
+        predictions = self.model.prepare_outputs(self.model.disaggregate(inputs_np))
+        loss = self.criterion(
+            torch.as_tensor(predictions, dtype=torch.float32),
+            torch.as_tensor(targets_np, dtype=torch.float32),
+        ).item()
+        return predictions, targets_np, loss
 
     def testModel(self):
-        """
-        Test the model on the test dataset and collect predictions.
-        """
-        self.model.eval()
-        test_loss = 0
+        if self.test_loader is None:
+            raise ValueError("Evaluator requires a test_loader or test_csv_dir.")
+
+        if self.test_csv_dir is not None:
+            raw_df = pd.read_csv(self.test_csv_dir, low_memory=False)
+            raw_timestamps = raw_df.iloc[:, 0].reset_index(drop=True)
+            raw_aggregate = raw_df.iloc[:, 1].astype(float).to_numpy()
+            raw_target = raw_df.iloc[:, 2].astype(float).to_numpy()
+        else:
+            if self.raw_timestamps is None or self.raw_aggregate is None or self.raw_target is None:
+                raise ValueError(
+                    "Evaluator requires timestamps, aggregate_series, and target_series when test_csv_dir is not provided."
+                )
+            raw_timestamps = self.raw_timestamps
+            raw_aggregate = self.raw_aggregate
+            raw_target = self.raw_target
+        total_length = len(raw_target)
+
+        if self.normalisation_params is None:
+            raise ValueError(
+                "Evaluator requires normalisation_params when test_csv_dir is not provided."
+            )
+
+        appliance_mean = self.normalisation_params["appliance_mean"]
+        appliance_std = self.normalisation_params["appliance_std"]
+
+        prediction_windows = []
+        test_loss = 0.0
         time_start = time.time()
-        with torch.no_grad():
-                for inputs, targets in self.test_loader:
-                        inputs, targets = inputs.to(self.device), targets.to(self.device)
-                        outputs = self.model(inputs)
-                        loss = self.criterion(outputs.squeeze(-1), targets)
-                        test_loss += loss.item()
 
-                        denormalised_outputs = outputs.squeeze(-1) * self.appliance_std + self.appliance_mean
-                        denormalised_targets = targets * self.appliance_std + self.appliance_mean
-                        denormalised_inputs = inputs * self.aggregate_std + self.aggregate_mean
+        if getattr(self.model, "supports_gradient", False):
+            self.model.eval()
 
-                        self.predictions.extend(denormalised_outputs.cpu().numpy().flatten())
-                        self.ground_truth.extend(denormalised_targets.cpu().numpy().flatten())
-                        self.aggregate.extend(denormalised_inputs[:, self.offset].cpu().numpy().flatten())
+        with torch.no_grad() if getattr(self.model, "supports_gradient", False) else _nullcontext():
+            for inputs, targets in self.test_loader:
+                predictions, _, loss = self._run_batch(inputs, targets)
+                prediction_windows.append(predictions)
+                test_loss += loss
 
+        self.dt = time.time() - time_start
+        prediction_windows = np.concatenate(prediction_windows, axis=0)
+        prediction_windows = (prediction_windows * appliance_std) + appliance_mean
 
-        trim_length = len(self.predictions)
-        self.timestamps = self.timestamps[:trim_length]
+        reconstructed, coverage = reconstruct_series_from_windows(
+            prediction_windows,
+            total_length,
+            target_mode=self.model.get_target_type(),
+            output_offset=self.model.get_output_offset(),
+            output_size=self.model.get_output_size(),
+        )
+        valid_mask = coverage > 0
 
-        self.predictions = [max(0, pred) for pred in self.predictions]
-        self.predictions = [min(pred, agg) for pred, agg in zip(self.predictions, self.aggregate)]
-        self.ground_truth = [max(0, gt) for gt in self.ground_truth]
-        self.aggregate = [max(0, agg) for agg in self.aggregate]
+        self.timestamps = raw_timestamps[valid_mask].reset_index(drop=True)
+        self.aggregate = np.clip(raw_aggregate[valid_mask], 0.0, None).tolist()
+        self.ground_truth = np.clip(raw_target[valid_mask], 0.0, None).tolist()
+        predictions = np.clip(reconstructed[valid_mask], 0.0, None)
+        predictions = np.minimum(predictions, np.asarray(self.aggregate, dtype=np.float32))
+        self.predictions = predictions.tolist()
 
-        test_loss /= len(self.test_loader)
-        time_end = time.time()
-        self.dt = time_end - time_start
+        test_loss /= max(1, len(self.test_loader))
         print(f"Test Loss: {test_loss}")
 
-    
+    def evaluate(self):
+        self.testModel()
+        return self.getMetrics()
+
     def getResults(self):
-        """
-        Return the results of the test as a pandas dataframe
-        """
-        results_df = pd.DataFrame({
+        return pd.DataFrame(
+            {
                 "time": self.timestamps,
                 "aggregate": self.aggregate,
                 "prediction": self.predictions,
-                "ground truth": self.ground_truth
-        })
-        return results_df
+                "ground truth": self.ground_truth,
+            }
+        )
 
     def getMetrics(self):
-        """
-        Calculate the metrics for the test.
-        Also return the time taken for disaggreation.
-        """
-        predictions = np.array(self.predictions)
-        ground_truth = np.array(self.ground_truth)
-        
-        MAE = np.mean(np.abs(predictions - ground_truth))
-        SAE = abs(sum(predictions) - sum(ground_truth)) / sum(ground_truth)
-
-        return MAE, SAE, self.dt
+        metrics = compute_metrics(self.predictions, self.ground_truth)
+        return metrics["MAE"], metrics["SAE"], self.dt
 
     def saveMetrics(self):
-        """
-        Save metrics (MAE, SAE) to a CSV file.
-        """
-        MAE, SAE, dt = self.getMetrics()
-        metrics_df = pd.DataFrame({
-            "appliance": [self.appliance_name_formatted],
-            "model": [self.model_name],
-            "dataset": [self.dataset],
-            "MAE": [MAE],
-            "SAE": [SAE],
-            "inference_time": [dt]
-        })
+        mae, sae, dt = self.getMetrics()
+        metrics_df = pd.DataFrame(
+            {
+                "appliance": [self.appliance_name_formatted],
+                "model": [self.model_name],
+                "dataset": [self.dataset],
+                "MAE": [mae],
+                "SAE": [sae],
+                "inference_time": [dt],
+            }
+        )
         metrics_filename = f"{self.appliance_name_formatted}_{self.model_name}_metrics.csv"
         metrics_path = os.path.join(self.result_dir, metrics_filename)
         metrics_df.to_csv(metrics_path, index=False)
         print(f"Metrics saved to {metrics_path}")
-        return MAE, SAE, dt
+        return mae, sae, dt
 
     def _get_zoom_window_file(self):
-        """
-        Get the file path for storing zoom window indices.
-        """
         return os.path.join(self.result_dir, f"{self.appliance_name_formatted}_zoom_window.json")
 
     def _load_saved_zoom_window(self):
-        """
-        Load previously saved zoom window indices.
-        Returns None if file doesn't exist.
-        """
         zoom_file = self._get_zoom_window_file()
         if os.path.exists(zoom_file):
             try:
-                with open(zoom_file, 'r') as f:
-                    data = json.load(f)
-                    return data.get('start'), data.get('end')
-            except:
+                with open(zoom_file, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                return data.get("start"), data.get("end")
+            except Exception:
                 pass
         return None, None
 
     def _save_zoom_window(self, start_idx, end_idx):
-        """
-        Save zoom window indices for consistent plotting across different models.
-        """
-        zoom_file = self._get_zoom_window_file()
-        with open(zoom_file, 'w') as f:
-            json.dump({'start': start_idx, 'end': end_idx}, f)
+        with open(self._get_zoom_window_file(), "w", encoding="utf-8") as handle:
+            json.dump({"start": int(start_idx), "end": int(end_idx)}, handle)
 
     def _find_active_region(self, min_peaks=2, window_size=100):
-        """
-        Find a region with 2-3 large wave peaks where ground truth has significant values.
-        
-        Args:
-            min_peaks: Minimum number of peaks to find (default 2)
-            window_size: Size of the window to search for peaks (default 100)
-        
-        Returns:
-            tuple: (start_index, end_index) or None if no suitable region found
-        """
-        from scipy.signal import find_peaks
-        
-        ground_truth = np.array(self.ground_truth)
-        data_length = len(ground_truth)
-        
+        try:
+            from scipy.signal import find_peaks
+        except Exception:
+            nonzero = np.flatnonzero(np.asarray(self.ground_truth, dtype=np.float32) > 0)
+            if nonzero.size == 0:
+                return None
+            start_idx = int(nonzero[0])
+            end_idx = min(len(self.ground_truth), start_idx + window_size)
+            return start_idx, end_idx
+
+        ground_truth = np.asarray(self.ground_truth, dtype=np.float32)
+        if ground_truth.size == 0:
+            return None
+
         threshold = np.max(ground_truth) * 0.4
-        
         best_start = None
         best_end = None
-        best_max_peak = 0
-        
-        step = window_size // 2
-        
-        for start in range(0, data_length - window_size, step):
-            end = min(start + window_size, data_length)
-            
-            gt_segment = ground_truth[start:end]
-            
-            if np.max(gt_segment) < threshold:
+        best_peak = 0.0
+
+        for start_idx in range(0, max(1, len(ground_truth) - window_size), max(1, window_size // 2)):
+            end_idx = min(start_idx + window_size, len(ground_truth))
+            segment = ground_truth[start_idx:end_idx]
+            if np.max(segment) < threshold:
                 continue
-            
-            peaks, properties = find_peaks(gt_segment, height=threshold * 0.5, distance=10, prominence=threshold * 0.3)
-            peak_count = len(peaks)
-            peak_heights = properties['peak_heights']
-            max_peak_height = np.max(peak_heights) if len(peak_heights) > 0 else 0
-            
-            if peak_count >= min_peaks and max_peak_height > best_max_peak:
-                best_max_peak = max_peak_height
-                best_start = start
-                best_end = end
-        
-        if best_start is not None:
-            return best_start, best_end
-        
-        return None
+
+            peaks, properties = find_peaks(
+                segment,
+                height=threshold * 0.5,
+                distance=10,
+                prominence=threshold * 0.3,
+            )
+            peak_heights = properties.get("peak_heights", [])
+            max_peak = float(np.max(peak_heights)) if len(peak_heights) > 0 else 0.0
+            if len(peaks) >= min_peaks and max_peak > best_peak:
+                best_peak = max_peak
+                best_start = start_idx
+                best_end = end_idx
+
+        if best_start is None:
+            return None
+        return best_start, best_end
 
     def _get_zoom_window(self):
-        """
-        Get zoom window indices for plotting.
-        First checks if a window was previously saved (for consistency across models).
-        If not, finds a new window where both ground truth and prediction are > 0.
-        
-        Returns:
-            tuple: (start_index, end_index)
-        """
         saved_start, saved_end = self._load_saved_zoom_window()
-        
-        if saved_start is not None and saved_end is not None:
-            data_length = len(self.ground_truth)
-            if saved_start < data_length and saved_end <= data_length:
-                return saved_start, saved_end
-        
+        if saved_start is not None and saved_end is not None and saved_end <= len(self.ground_truth):
+            return saved_start, saved_end
+
         active_region = self._find_active_region()
-        
         if active_region is not None:
-            self._save_zoom_window(active_region[0], active_region[1])
+            self._save_zoom_window(*active_region)
             return active_region
-        
         return 0, min(10, len(self.ground_truth))
 
     def plotResults(self):
-        """
-        Plot the results of the test and save to result directory.
-        """
-        results_df = pd.DataFrame({
-                "time": self.timestamps,
-                "aggregate": self.aggregate,
-                "prediction": self.predictions,
-                "ground truth": self.ground_truth
-        })
-        
-        plt.figure(figsize=(30, 6))
+        results_df = self.getResults()
+        if results_df.empty:
+            return
+
         results_df["time"] = pd.to_datetime(results_df["time"])
+        plt.figure(figsize=(30, 6))
         plt.plot(results_df["time"], results_df["aggregate"], label="Aggregate", alpha=0.7)
         plt.plot(results_df["time"], results_df["ground truth"], label="Ground Truth", alpha=0.7)
         plt.plot(results_df["time"], results_df["prediction"], label="Prediction", alpha=0.7)
@@ -263,46 +283,51 @@ class Tester:
         plt.xlabel("Timestamp")
         plt.ylabel("Power (Watts)")
         plt.legend()
-        plt.title("Aggregate, Ground Truth, and Prediction Comparison")
         plt.xticks(rotation=45)
         plt.tight_layout()
 
         mae, sae, dt = self.getMetrics()
         plt.figtext(0.15, 0.01, f"MAE: {mae:.2f} Watts, SAE: {sae:.2f}, Inference Time: {dt:.2f} seconds", ha="left", fontsize=12)
-        
+
         plot_filename = f"prediction_plot_{self.appliance_name_formatted}_{self.model_name}.png"
         plot_path = os.path.join(self.result_dir, plot_filename)
-        plt.savefig(plot_path, bbox_inches='tight', dpi=300)
+        plt.savefig(plot_path, bbox_inches="tight", dpi=300)
         plt.close()
         print(f"Plot saved to {plot_path}")
-        
+
         zoom_start, zoom_end = self._get_zoom_window()
-        zoom_time = results_df["time"].iloc[zoom_start:zoom_end]
         zoom_ground_truth = results_df["ground truth"].iloc[zoom_start:zoom_end]
         zoom_prediction = results_df["prediction"].iloc[zoom_start:zoom_end]
-        
+
         fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(range(len(zoom_ground_truth)), zoom_ground_truth, color='#1f77b4', label='Ground truth', linewidth=1.8)
-        ax.plot(range(len(zoom_prediction)), zoom_prediction, color='#ff7f0e', label='Seq2point', linewidth=1.8)
-        
-        ax.set_xlabel('')
-        ax.set_ylabel('Power (W)')
-        ax.legend(loc='upper left', frameon=True)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
+        ax.plot(range(len(zoom_ground_truth)), zoom_ground_truth, color="#1f77b4", label="Ground truth", linewidth=1.8)
+        ax.plot(range(len(zoom_prediction)), zoom_prediction, color="#ff7f0e", label=self.model_name, linewidth=1.8)
+        ax.set_ylabel("Power (W)")
+        ax.legend(loc="upper left", frameon=True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
         ax.set_xticks([])
-        
         plt.tight_layout()
-        
+
         zoom_plot_filename = f"zoomed_plot_{self.appliance_name_formatted}_{self.model_name}.png"
         zoom_plot_path = os.path.join(self.result_dir, zoom_plot_filename)
-        plt.savefig(zoom_plot_path, bbox_inches='tight', dpi=150)
+        plt.savefig(zoom_plot_path, bbox_inches="tight", dpi=150)
         plt.close()
         print(f"Zoomed plot saved to {zoom_plot_path}")
-        
+
         results_filename = f"{self.appliance_name_formatted}_results.csv"
         results_path = os.path.join(self.result_dir, results_filename)
         results_df.to_csv(results_path, index=False)
         print(f"Results CSV saved to {results_path}")
-        
         self.saveMetrics()
+
+
+class _nullcontext:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exc_type, exc, exc_tb):
+        return False
+
+
+Tester = Evaluator
