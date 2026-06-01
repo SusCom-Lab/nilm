@@ -12,6 +12,7 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
+from model_pipeline.classical_data import load_grouped_classical_data
 from model_pipeline.data_feeder import SlidingWindowDataset
 from model_pipeline.model_registry import create_model
 
@@ -145,11 +146,20 @@ class Trainer:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.batch_size = batch_size
         self.seed = seed
+        self.train_csv_dirs = train_csv_dirs
+        self.joint_classical_data = None
 
         if getattr(self.model, "supports_gradient", False):
             self.model.to(self.device)
 
-        if train_loader is None and train_csv_dirs is not None:
+        if (
+            train_loader is None
+            and train_csv_dirs is not None
+            and not (
+                not getattr(self.model, "supports_gradient", False)
+                and getattr(self.model, "is_joint_model", lambda: False)()
+            )
+        ):
             train_loader, validation_loader = build_windowed_loaders(
                 train_csv_dirs,
                 window_size=self.model.get_window_size(),
@@ -188,10 +198,22 @@ class Trainer:
         targets = self.model.prepare_targets(targets.to(self.device))
         return inputs, targets
 
+    def _model_loss_hook(self):
+        hook = getattr(self.model, "compute_loss", None)
+        return hook if callable(hook) else None
+
     def _torch_loss(self, inputs, targets):
+        hook = self._model_loss_hook()
+        if hook is not None:
+            loss_output = hook(inputs, targets, criterion=self.criterion)
+            if isinstance(loss_output, tuple):
+                loss, outputs = loss_output
+                return loss, self.model.prepare_outputs(outputs)
+            return loss_output, None
+
         outputs = self.model(inputs)
         outputs = self.model.prepare_outputs(outputs)
-        return self.criterion(outputs, targets)
+        return self.criterion(outputs, targets), outputs
 
     def _collect_numpy_loader(self, loader):
         all_inputs = []
@@ -202,6 +224,9 @@ class Trainer:
         return np.concatenate(all_inputs, axis=0), np.concatenate(all_targets, axis=0)
 
     def _save_checkpoint(self):
+        appliance_name = self.appliance_name_formatted
+        if getattr(self.model, "is_joint_model", lambda: False)():
+            appliance_name = "multi_appliance"
         checkpoint = {
             "model_name": self.model_name,
             "model_key": getattr(self.model, "_registry_key", self.model_name),
@@ -209,11 +234,15 @@ class Trainer:
             "output_size": self.model.get_output_size(),
             "output_offset": self.model.get_output_offset(),
             "target_type": self.model.get_target_type(),
-            "appliance": self.appliance_name_formatted,
+            "appliance": appliance_name,
             "dataset": self.dataset,
             "init_kwargs": self.model.get_init_kwargs(),
             "model_state": self.model.export_state(),
         }
+        if getattr(self.model, "is_joint_model", lambda: False)():
+            checkpoint["joint_mode"] = True
+            checkpoint["grouping_key"] = self.model.get_grouping_key()
+            checkpoint["appliances"] = list(getattr(self.model, "appliance_order", []))
         if getattr(self.model, "supports_gradient", False):
             checkpoint["model_state_dict"] = checkpoint["model_state"]
 
@@ -223,9 +252,25 @@ class Trainer:
 
     def trainModel(self, num_epochs=10):
         if self.train_loader is None:
-            raise ValueError("Trainer requires a train_loader or train_csv_dirs.")
+            if not (
+                not getattr(self.model, "supports_gradient", False)
+                and getattr(self.model, "is_joint_model", lambda: False)()
+                and self.train_csv_dirs is not None
+            ):
+                raise ValueError("Trainer requires a train_loader or train_csv_dirs.")
 
         if not getattr(self.model, "supports_gradient", False):
+            if getattr(self.model, "is_joint_model", lambda: False)():
+                if self.train_csv_dirs is None:
+                    raise ValueError("Joint classical models require train_csv_dirs.")
+                self.joint_classical_data = load_grouped_classical_data(self.train_csv_dirs)
+                self.model.fit_joint(self.joint_classical_data)
+                self.train_losses.append(0.0)
+                self.val_losses.append(0.0)
+                checkpoint_path = self._save_checkpoint()
+                print(f"Joint classical model fitted. Checkpoint saved to {checkpoint_path}")
+                return
+
             train_inputs, train_targets = self._collect_numpy_loader(self.train_loader)
             self.model.fit(train_inputs, train_targets)
             train_predictions = self.model.prepare_outputs(self.model.disaggregate(train_inputs))
@@ -255,7 +300,7 @@ class Trainer:
             for inputs, targets in self.train_loader:
                 inputs, targets = self._prepare_torch_batch(inputs, targets)
                 self.optimizer.zero_grad()
-                loss = self._torch_loss(inputs, targets)
+                loss, _ = self._torch_loss(inputs, targets)
                 loss.backward()
                 self.optimizer.step()
                 train_loss += loss.item()
@@ -269,7 +314,8 @@ class Trainer:
                 with torch.no_grad():
                     for inputs, targets in self.validation_loader:
                         inputs, targets = self._prepare_torch_batch(inputs, targets)
-                        val_loss += self._torch_loss(inputs, targets).item()
+                        loss, _ = self._torch_loss(inputs, targets)
+                        val_loss += loss.item()
                 val_loss /= max(1, len(self.validation_loader))
 
             print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss}, Val Loss: {val_loss}")

@@ -9,5 +9,6 @@ tables>=3.8.0
 h5py>=3.8.0
 matplotlib>=3.6.0
 scikit-learn>=1.2.0
+hmmlearn>=0.3.2
 ipython>=8.0.0
 cvxpy>=1.7.0

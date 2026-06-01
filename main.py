@@ -4,6 +4,7 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 from model_pipeline import finetune_model, get_model_entry, list_models, train_model, test_model
+from model_pipeline.model_registry import load_checkpoint
 from IPython import get_ipython
 
 
@@ -188,6 +189,13 @@ def trainModelCLI():
     print("Training a NILM baseline ...")
     using_colab = runningColab()
 
+    model_name = promptModelSelection()
+    input_window_length, model_init_kwargs = promptModelConfig(model_name)
+    entry = get_model_entry(model_name)
+    is_joint_classical = bool(getattr(entry.cls, "is_joint_classical", False))
+
+    if is_joint_classical:
+        print("Joint classical models expect multiple appliance CSVs and group them automatically by H1/H2.")
     train_csv_dirs = selectCSVFiles("train", using_colab)
 
     if not train_csv_dirs:
@@ -200,8 +208,6 @@ def trainModelCLI():
     model_save_dir = "/content" if using_colab else os.path.join(os.getcwd(), "saved_models")
     os.makedirs(model_save_dir, exist_ok=True)
 
-    model_name = promptModelSelection()
-    input_window_length, model_init_kwargs = promptModelConfig(model_name)
     num_epochs = _safe_int_input("Number of epochs", 10)
     val_ratio = _safe_float_input("Validation ratio", 0.2)
     seed = _safe_int_input("Random seed", 42)
@@ -226,16 +232,23 @@ def evaluateModelCLI():
     print("Evaluating a NILM baseline ...")
     using_colab = runningColab()
 
-    test_csv_dirs = selectCSVFiles("test", using_colab, single_file=True)
-    if not test_csv_dirs:
-        print("No test file selected. Exiting.")
-        return
-    test_csv_dir = test_csv_dirs[0]
-
     model_file_path = selectModelFile(using_colab)
     if not model_file_path:
         print("No model file selected. Exiting.")
         return
+
+    checkpoint = load_checkpoint(model_file_path)
+    joint_mode = bool(checkpoint.get("joint_mode", False))
+
+    if joint_mode:
+        print("Joint classical evaluation expects multiple appliance CSVs from the same house.")
+        test_csv_dirs = selectCSVFiles("test", using_colab, single_file=False)
+    else:
+        test_csv_dirs = selectCSVFiles("test", using_colab, single_file=True)
+    if not test_csv_dirs:
+        print("No test file selected. Exiting.")
+        return
+    test_csv_dir = test_csv_dirs if joint_mode else test_csv_dirs[0]
 
     dataset = input("Enter the dataset name (e.g., REDD, UKDALE): ")
 
@@ -247,10 +260,14 @@ def evaluateModelCLI():
     tester.testModel()
     tester.plotResults()
 
-    mae, sae, inference_time = tester.saveMetrics()
-    print(f"MAE: {mae:.2f} Watts")
-    print(f"SAE: {sae:.2f}")
-    print(f"Inference time: {inference_time:.2f} seconds")
+    metrics_result = tester.saveMetrics()
+    if joint_mode:
+        print(metrics_result)
+    else:
+        mae, sae, inference_time = metrics_result
+        print(f"MAE: {mae:.2f} Watts")
+        print(f"SAE: {sae:.2f}")
+        print(f"Inference time: {inference_time:.2f} seconds")
     print("Model testing completed.")
 
 

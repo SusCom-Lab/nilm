@@ -135,6 +135,10 @@ class TorchNILMModel(nn.Module, BaseNILMModel):
 
 class ClassicalNILMModel(BaseNILMModel):
     supports_gradient = False
+    is_joint_classical = False
+
+    def is_joint_model(self) -> bool:
+        return False
 
     def fit(self, aggregate_windows: np.ndarray, target_windows: np.ndarray) -> None:
         raise NotImplementedError(f"{self.__class__.__name__} must implement fit().")
@@ -153,3 +157,21 @@ class ClassicalNILMModel(BaseNILMModel):
     @abstractmethod
     def set_state(self, state: dict[str, Any]) -> None:
         raise NotImplementedError
+
+
+class JointClassicalNILMModel(ClassicalNILMModel):
+    target_type = "sequence"
+    default_output_size = None
+    is_joint_classical = True
+
+    def get_grouping_key(self) -> str:
+        return "house"
+
+    def is_joint_model(self) -> bool:
+        return True
+
+    def fit_joint(self, grouped_train_data: dict[str, dict[str, Any]]) -> None:
+        raise NotImplementedError(f"{self.__class__.__name__} must implement fit_joint().")
+
+    def disaggregate_joint(self, grouped_test_data: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        raise NotImplementedError(f"{self.__class__.__name__} must implement disaggregate_joint().")

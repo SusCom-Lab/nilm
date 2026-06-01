@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from model_pipeline.classical_data import load_grouped_classical_data
 from model_pipeline.data_feeder import SlidingWindowDataset, reconstruct_series_from_windows
 from model_pipeline.model_registry import instantiate_from_checkpoint, load_checkpoint
 from model_pipeline.train_model import compute_metrics
@@ -47,6 +48,8 @@ class Evaluator:
         self.model = model
         self.model_name = getattr(model, "display_name", model.__class__.__name__)
         self.appliance_name_formatted = (checkpoint or {}).get("appliance", "appliance")
+        self.joint_mode = bool((checkpoint or {}).get("joint_mode", False))
+        self.joint_appliances = list((checkpoint or {}).get("appliances", []))
 
         self.result_dir = result_dir or os.path.join("result", self.dataset, self.appliance_name_formatted)
         os.makedirs(self.result_dir, exist_ok=True)
@@ -58,7 +61,7 @@ class Evaluator:
         self.raw_aggregate = None if aggregate_series is None else np.asarray(aggregate_series, dtype=np.float32)
         self.raw_target = None if target_series is None else np.asarray(target_series, dtype=np.float32)
 
-        if test_loader is None and test_csv_dir is not None:
+        if test_loader is None and test_csv_dir is not None and not self.joint_mode:
             test_dataset = SlidingWindowDataset(
                 [test_csv_dir],
                 self.model.get_window_size(),
@@ -78,13 +81,27 @@ class Evaluator:
         self.ground_truth = []
         self.aggregate = []
         self.timestamps = pd.Series(dtype=object)
+        self.joint_results: dict[str, pd.DataFrame] = {}
+        self.joint_metrics = pd.DataFrame()
+        self._joint_grouped_data = None
 
     def _run_batch(self, inputs, targets):
         if getattr(self.model, "supports_gradient", False):
             inputs = inputs.to(self.device)
             targets = self.model.prepare_targets(targets.to(self.device))
-            outputs = self.model.prepare_outputs(self.model(inputs))
-            loss = self.criterion(outputs, targets).item()
+            loss_hook = getattr(self.model, "compute_loss", None)
+            if callable(loss_hook):
+                loss_output = loss_hook(inputs, targets, criterion=self.criterion)
+                if isinstance(loss_output, tuple):
+                    loss, outputs = loss_output
+                    outputs = self.model.prepare_outputs(outputs)
+                else:
+                    loss = loss_output
+                    outputs = self.model.prepare_outputs(self.model(inputs))
+            else:
+                outputs = self.model.prepare_outputs(self.model(inputs))
+                loss = self.criterion(outputs, targets)
+            loss = float(loss.item())
             predictions = outputs.detach().cpu().numpy()
             targets_np = targets.detach().cpu().numpy()
             return predictions, targets_np, loss
@@ -99,6 +116,43 @@ class Evaluator:
         return predictions, targets_np, loss
 
     def testModel(self):
+        if self.joint_mode:
+            if not self.test_csv_dir:
+                raise ValueError("Joint classical evaluation requires test CSV inputs.")
+
+            csv_paths = self.test_csv_dir if isinstance(self.test_csv_dir, list) else [self.test_csv_dir]
+            grouped = load_grouped_classical_data(csv_paths)
+            self._joint_grouped_data = grouped
+
+            time_start = time.time()
+            self.joint_results = self.model.disaggregate_joint(grouped)
+            self.dt = time.time() - time_start
+
+            metric_rows = []
+            for group_id, predictions_df in self.joint_results.items():
+                group = grouped[group_id]
+                for appliance_name in predictions_df.columns:
+                    prediction = np.clip(
+                        predictions_df[appliance_name].to_numpy(dtype=np.float32),
+                        0.0,
+                        group.aggregate,
+                    )
+                    ground_truth = np.clip(group.appliances[appliance_name], 0.0, None)
+                    metrics = compute_metrics(prediction, ground_truth)
+                    metric_rows.append(
+                        {
+                            "group": group_id,
+                            "appliance": appliance_name,
+                            "model": self.model_name,
+                            "dataset": self.dataset,
+                            "MAE": metrics["MAE"],
+                            "SAE": metrics["SAE"],
+                            "inference_time": self.dt,
+                        }
+                    )
+            self.joint_metrics = pd.DataFrame(metric_rows)
+            return
+
         if self.test_loader is None:
             raise ValueError("Evaluator requires a test_loader or test_csv_dir.")
 
@@ -166,6 +220,8 @@ class Evaluator:
         return self.getMetrics()
 
     def getResults(self):
+        if self.joint_mode:
+            return dict(self.joint_results)
         return pd.DataFrame(
             {
                 "time": self.timestamps,
@@ -176,10 +232,19 @@ class Evaluator:
         )
 
     def getMetrics(self):
+        if self.joint_mode:
+            return self.joint_metrics.copy()
         metrics = compute_metrics(self.predictions, self.ground_truth)
         return metrics["MAE"], metrics["SAE"], self.dt
 
     def saveMetrics(self):
+        if self.joint_mode:
+            metrics_filename = f"{self.model_name}_metrics.csv"
+            metrics_path = os.path.join(self.result_dir, metrics_filename)
+            self.joint_metrics.to_csv(metrics_path, index=False)
+            print(f"Metrics saved to {metrics_path}")
+            return self.joint_metrics
+
         mae, sae, dt = self.getMetrics()
         metrics_df = pd.DataFrame(
             {
@@ -270,6 +335,57 @@ class Evaluator:
         return 0, min(10, len(self.ground_truth))
 
     def plotResults(self):
+        if self.joint_mode:
+            if not self.joint_results:
+                return
+
+            grouped = self._joint_grouped_data
+            if grouped is None:
+                csv_paths = self.test_csv_dir if isinstance(self.test_csv_dir, list) else [self.test_csv_dir]
+                grouped = load_grouped_classical_data(csv_paths)
+
+            for group_id, predictions_df in self.joint_results.items():
+                group = grouped[group_id]
+                for appliance_name in predictions_df.columns:
+                    result_df = pd.DataFrame(
+                        {
+                            "time": group.time.reset_index(drop=True),
+                            "aggregate": np.clip(group.aggregate, 0.0, None),
+                            "prediction": np.clip(
+                                predictions_df[appliance_name].to_numpy(dtype=np.float32),
+                                0.0,
+                                group.aggregate,
+                            ),
+                            "ground truth": np.clip(group.appliances[appliance_name], 0.0, None),
+                        }
+                    )
+                    safe_appliance = appliance_name.replace(" ", "_")
+                    result_path = os.path.join(self.result_dir, f"{safe_appliance}_results.csv")
+                    result_df.to_csv(result_path, index=False)
+                    print(f"Results CSV saved to {result_path}")
+
+                    plot_df = result_df.copy()
+                    plot_df["time"] = pd.to_datetime(plot_df["time"])
+                    plt.figure(figsize=(30, 6))
+                    plt.plot(plot_df["time"], plot_df["aggregate"], label="Aggregate", alpha=0.7)
+                    plt.plot(plot_df["time"], plot_df["ground truth"], label="Ground Truth", alpha=0.7)
+                    plt.plot(plot_df["time"], plot_df["prediction"], label="Prediction", alpha=0.7)
+                    plt.title(f"Prediction Plot for {safe_appliance} using {self.model_name}")
+                    plt.xlabel("Timestamp")
+                    plt.ylabel("Power (Watts)")
+                    plt.legend()
+                    plt.xticks(rotation=45)
+                    plt.tight_layout()
+
+                    plot_filename = f"prediction_plot_{safe_appliance}_{self.model_name}.png"
+                    plot_path = os.path.join(self.result_dir, plot_filename)
+                    plt.savefig(plot_path, bbox_inches="tight", dpi=300)
+                    plt.close()
+                    print(f"Plot saved to {plot_path}")
+
+            self.saveMetrics()
+            return
+
         results_df = self.getResults()
         if results_df.empty:
             return

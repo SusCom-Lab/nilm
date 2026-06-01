@@ -1,62 +1,66 @@
 """
-Classical AFHMM baselines for NILM.
-
-This file contains the AFHMM baseline and the AFHMM_SAC variant. These
-implementations are implemented for this project based on the cited papers. A
-confirmed related open-source baseline collection covering these algorithms is:
-https://github.com/nilmtk/nilmtk-contrib
-
-Paper references:
-    Zhong, M., Goddard, N., and Sutton, C. (2014).
-    "Signal Aggregate Constraints in Additive Factorial HMMs, with Application
-    to Energy Disaggregation." Advances in Neural Information Processing
-    Systems 27.
-
-    Kolter, J. Z., and Jaakkola, T. (2012).
-    "Approximate Inference in Additive Factorial HMMs with Application to
-    Energy Disaggregation." Proceedings of the 15th International Conference
-    on Artificial Intelligence and Statistics.
+AFHMM baselines adapted to joint multi-appliance disaggregation.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
+from model_pipeline.classical_data import ClassicalGroup
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.base_model import ClassicalNILMModel
+from model_pipeline.models.base_model import JointClassicalNILMModel
 
 
-def _ensure_2d(array: np.ndarray) -> np.ndarray:
-    array = np.asarray(array, dtype=np.float32)
-    if array.ndim == 1:
-        return array[:, None]
-    return array
+def _fit_gaussian_hmm(values: np.ndarray, n_states: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    try:
+        from hmmlearn import hmm
+    except ImportError as exc:
+        raise ImportError("AFHMM requires 'hmmlearn'. Install it with `pip install hmmlearn`.") from exc
+
+    values = np.asarray(values, dtype=np.float32).reshape(-1, 1)
+    if values.size == 0:
+        raise ValueError("Cannot fit AFHMM on empty values.")
+
+    model = hmm.GaussianHMM(n_components=n_states, covariance_type="full")
+    model.fit(values)
+    means = model.means_.flatten().reshape(-1, 1).astype(np.float32)
+    states = model.predict(values)
+    transmat = np.clip(model.transmat_.T.astype(np.float32), 1e-8, None)
+    counts = Counter(states.flatten())
+    priors = np.zeros(n_states, dtype=np.float32)
+    total = max(1, sum(counts.values()))
+    for idx in range(n_states):
+        priors[idx] = counts.get(idx, 0) / total
+    priors = np.clip(priors, 1e-8, None)
+    return means, priors, transmat
 
 
-class _WindowClassicalModel(ClassicalNILMModel):
-    target_type = "sequence"
-    default_output_size = None
+def _serialise_value(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {key: _serialise_value(subvalue) for key, subvalue in value.items()}
+    if isinstance(value, list):
+        return [_serialise_value(item) for item in value]
+    return value
 
-    def __init__(self, *, window_size: int = 599, **kwargs):
-        super().__init__(window_size=window_size, **kwargs)
 
-    def _serialise_arrays(self, state: dict[str, Any]) -> dict[str, Any]:
-        serialised = {}
-        for key, value in state.items():
-            serialised[key] = value.tolist() if isinstance(value, np.ndarray) else value
-        return serialised
-
-    def _deserialise_arrays(self, state: dict[str, Any]) -> dict[str, Any]:
-        restored = {}
-        for key, value in state.items():
-            restored[key] = np.asarray(value, dtype=np.float32) if isinstance(value, list) else value
-        return restored
+def _deserialise_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _deserialise_value(subvalue) for key, subvalue in value.items()}
+    if isinstance(value, list):
+        if value and all(not isinstance(item, (dict, list)) for item in value):
+            return np.asarray(value, dtype=np.float32)
+        return [_deserialise_value(item) for item in value]
+    return value
 
 
 @register_model("afhmm", aliases=("AFHMM",), display_name="AFHMM")
-class AFHMMBaseline(_WindowClassicalModel):
+class AFHMMBaseline(JointClassicalNILMModel):
     display_name = "AFHMM"
     model_family = "probabilistic"
 
@@ -64,202 +68,171 @@ class AFHMMBaseline(_WindowClassicalModel):
         self,
         *,
         window_size: int = 599,
-        n_appliance_states: int = 3,
-        n_background_states: int = 3,
-        max_training_windows: int = 1024,
-        transition_smoothing: float = 1e-3,
+        n_states: int = 2,
+        optimisation_epochs: int = 6,
+        sigma_floor: float = 1.0,
+        solver: str = "SCS",
         **kwargs,
     ):
         super().__init__(
             window_size=window_size,
-            n_appliance_states=n_appliance_states,
-            n_background_states=n_background_states,
-            max_training_windows=max_training_windows,
-            transition_smoothing=transition_smoothing,
+            n_states=n_states,
+            optimisation_epochs=optimisation_epochs,
+            sigma_floor=sigma_floor,
+            solver=solver,
             **kwargs,
         )
-        self.n_appliance_states = n_appliance_states
-        self.n_background_states = n_background_states
-        self.max_training_windows = max_training_windows
-        self.transition_smoothing = transition_smoothing
-        self.appliance_means = None
-        self.background_means = None
-        self.appliance_log_transitions = None
-        self.background_log_transitions = None
-        self.appliance_log_prior = None
-        self.background_log_prior = None
-
-    def _fit_chain(self, values: np.ndarray, n_states: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        values = np.asarray(values, dtype=np.float32).reshape(-1)
-        if values.size == 0:
-            raise ValueError("Cannot fit AFHMM on empty values.")
-
-        quantiles = np.linspace(0.0, 1.0, num=n_states + 2)[1:-1]
-        means = np.quantile(values, quantiles) if n_states > 1 else np.array([values.mean()], dtype=np.float32)
-        means = np.sort(np.asarray(means, dtype=np.float32))
-
-        for _ in range(8):
-            distances = np.abs(values[:, None] - means[None, :])
-            assignments = np.argmin(distances, axis=1)
-            updated = means.copy()
-            for idx in range(n_states):
-                cluster = values[assignments == idx]
-                if cluster.size > 0:
-                    updated[idx] = cluster.mean()
-            if np.allclose(updated, means):
-                break
-            means = np.sort(updated)
-
-        distances = np.abs(values[:, None] - means[None, :])
-        assignments = np.argmin(distances, axis=1)
-        transition_counts = np.full((n_states, n_states), self.transition_smoothing, dtype=np.float32)
-        for prev_state, next_state in zip(assignments[:-1], assignments[1:]):
-            transition_counts[prev_state, next_state] += 1.0
-
-        transitions = transition_counts / transition_counts.sum(axis=1, keepdims=True)
-        priors = np.bincount(assignments, minlength=n_states).astype(np.float32) + self.transition_smoothing
-        priors /= priors.sum()
-        return means, np.log(transitions), np.log(priors)
+        self.n_states = n_states
+        self.optimisation_epochs = optimisation_epochs
+        self.sigma_floor = sigma_floor
+        self.solver = solver
+        self.appliance_order: list[str] = []
+        self.means_vector: dict[str, np.ndarray] = {}
+        self.pi_vector: dict[str, np.ndarray] = {}
+        self.transmat_vector: dict[str, np.ndarray] = {}
+        self.signal_aggregates: dict[str, float] = {}
 
     def fit(self, aggregate_windows: np.ndarray, target_windows: np.ndarray) -> None:
-        aggregate_windows = _ensure_2d(aggregate_windows)
-        target_windows = _ensure_2d(target_windows)
-        sample_size = min(len(aggregate_windows), self.max_training_windows)
-        sample_indices = np.linspace(0, len(aggregate_windows) - 1, num=sample_size, dtype=int)
-        aggregate_sample = aggregate_windows[sample_indices]
-        target_sample = target_windows[sample_indices]
-        background_sample = aggregate_sample - target_sample
-
-        self.appliance_means, self.appliance_log_transitions, self.appliance_log_prior = self._fit_chain(
-            target_sample.reshape(-1),
-            self.n_appliance_states,
-        )
-        self.background_means, self.background_log_transitions, self.background_log_prior = self._fit_chain(
-            background_sample.reshape(-1),
-            self.n_background_states,
-        )
-
-    def _viterbi_disaggregate(self, aggregate_sequence: np.ndarray) -> np.ndarray:
-        if self.appliance_means is None or self.background_means is None:
-            raise RuntimeError("AFHMMBaseline must be fitted before disaggregation.")
-
-        aggregate_sequence = np.asarray(aggregate_sequence, dtype=np.float32).reshape(-1)
-        n_steps = aggregate_sequence.size
-        n_joint_states = self.n_appliance_states * self.n_background_states
-        scores = np.full((n_steps, n_joint_states), -np.inf, dtype=np.float32)
-        backpointers = np.zeros((n_steps, n_joint_states), dtype=np.int32)
-        emission_means = np.array(
-            [
-                self.appliance_means[a_idx] + self.background_means[b_idx]
-                for a_idx in range(self.n_appliance_states)
-                for b_idx in range(self.n_background_states)
-            ],
-            dtype=np.float32,
-        )
-
-        for joint_idx in range(n_joint_states):
-            a_idx = joint_idx // self.n_background_states
-            b_idx = joint_idx % self.n_background_states
-            prior = self.appliance_log_prior[a_idx] + self.background_log_prior[b_idx]
-            emission = -((aggregate_sequence[0] - emission_means[joint_idx]) ** 2)
-            scores[0, joint_idx] = prior + emission
-
-        for time_idx in range(1, n_steps):
-            for joint_idx in range(n_joint_states):
-                a_idx = joint_idx // self.n_background_states
-                b_idx = joint_idx % self.n_background_states
-                emission = -((aggregate_sequence[time_idx] - emission_means[joint_idx]) ** 2)
-                transition_scores = np.empty(n_joint_states, dtype=np.float32)
-                for prev_joint_idx in range(n_joint_states):
-                    prev_a_idx = prev_joint_idx // self.n_background_states
-                    prev_b_idx = prev_joint_idx % self.n_background_states
-                    transition_scores[prev_joint_idx] = (
-                        scores[time_idx - 1, prev_joint_idx]
-                        + self.appliance_log_transitions[prev_a_idx, a_idx]
-                        + self.background_log_transitions[prev_b_idx, b_idx]
-                    )
-                best_prev = int(np.argmax(transition_scores))
-                scores[time_idx, joint_idx] = transition_scores[best_prev] + emission
-                backpointers[time_idx, joint_idx] = best_prev
-
-        best_last = int(np.argmax(scores[-1]))
-        state_path = [best_last]
-        for time_idx in range(n_steps - 1, 0, -1):
-            state_path.append(int(backpointers[time_idx, state_path[-1]]))
-        state_path.reverse()
-
-        prediction = np.zeros(n_steps, dtype=np.float32)
-        for time_idx, joint_idx in enumerate(state_path):
-            appliance_state = joint_idx // self.n_background_states
-            prediction[time_idx] = self.appliance_means[appliance_state]
-        return prediction
+        raise NotImplementedError("AFHMMBaseline now uses fit_joint().")
 
     def disaggregate(self, inputs: np.ndarray) -> np.ndarray:
-        inputs = _ensure_2d(inputs)
-        return np.vstack([self._viterbi_disaggregate(window) for window in inputs])
+        raise NotImplementedError("AFHMMBaseline now uses disaggregate_joint().")
+
+    def fit_joint(self, grouped_train_data: dict[str, ClassicalGroup]) -> None:
+        if not grouped_train_data:
+            raise ValueError("AFHMMBaseline requires non-empty grouped training data.")
+
+        appliance_names = sorted(next(iter(grouped_train_data.values())).appliances.keys())
+        self.appliance_order = appliance_names
+        concatenated_targets: dict[str, list[np.ndarray]] = {name: [] for name in appliance_names}
+        for group in grouped_train_data.values():
+            if sorted(group.appliances.keys()) != appliance_names:
+                raise ValueError("All grouped training entries must contain the same appliance set.")
+            for appliance_name in appliance_names:
+                concatenated_targets[appliance_name].append(group.appliances[appliance_name])
+
+        self.means_vector = {}
+        self.pi_vector = {}
+        self.transmat_vector = {}
+        self.signal_aggregates = {}
+        for appliance_name in appliance_names:
+            values = np.concatenate(concatenated_targets[appliance_name], axis=0)
+            means, priors, transmat = _fit_gaussian_hmm(values, self.n_states)
+            self.means_vector[appliance_name] = means
+            self.pi_vector[appliance_name] = priors
+            self.transmat_vector[appliance_name] = transmat
+            self.signal_aggregates[appliance_name] = float(np.mean(values))
+
+    def _build_joint_constraints(self, length: int):
+        import cvxpy as cvx
+
+        constraints: list[Any] = []
+        state_vectors: dict[str, Any] = {}
+        transition_matrices: dict[str, list[Any]] = {}
+        for appliance_name in self.appliance_order:
+            state_vector = cvx.Variable((length, self.n_states), name=f"{appliance_name}_state_vec")
+            variable_matrices = [
+                cvx.Variable((self.n_states, self.n_states), name=f"{appliance_name}_transition_{idx}")
+                for idx in range(length)
+            ]
+            state_vectors[appliance_name] = state_vector
+            transition_matrices[appliance_name] = variable_matrices
+            constraints.extend([state_vector >= 0, state_vector <= 1])
+            for t in range(length):
+                constraints.append(cvx.sum(state_vector[t]) == 1)
+                constraints.extend([variable_matrices[t] >= 0, variable_matrices[t] <= 1])
+                for state_idx in range(self.n_states):
+                    constraints.append(cvx.sum(variable_matrices[t].T[state_idx]) == state_vector[t][state_idx])
+            for t in range(1, length):
+                for state_idx in range(self.n_states):
+                    constraints.append(cvx.sum(variable_matrices[t][state_idx]) == state_vector[t - 1][state_idx])
+        return state_vectors, transition_matrices, constraints
+
+    def _maybe_add_constraints(self, constraints: list[Any], state_vectors: dict[str, Any]) -> None:
+        del constraints, state_vectors
+
+    def _solve_group(self, aggregate_sequence: np.ndarray) -> pd.DataFrame:
+        import cvxpy as cvx
+
+        if not self.appliance_order:
+            raise RuntimeError("AFHMMBaseline must be fitted before disaggregation.")
+
+        aggregate_sequence = np.asarray(aggregate_sequence, dtype=np.float32).reshape(-1, 1)
+        length = len(aggregate_sequence)
+        sigma = 100 * np.ones((length, 1), dtype=np.float32)
+
+        state_vectors, transition_matrices, constraints = self._build_joint_constraints(length)
+        self._maybe_add_constraints(constraints, state_vectors)
+
+        total_usage = np.zeros((length, 1), dtype=np.float32)
+        for appliance_name in self.appliance_order:
+            total_usage = total_usage + state_vectors[appliance_name] @ self.means_vector[appliance_name]
+
+        term_1 = 0
+        term_2 = 0
+        for appliance_name in self.appliance_order:
+            for matrix in transition_matrices[appliance_name]:
+                term_1 -= cvx.sum(cvx.multiply(matrix, np.log(self.transmat_vector[appliance_name])))
+            term_2 -= cvx.sum(cvx.multiply(state_vectors[appliance_name][0], np.log(self.pi_vector[appliance_name])))
+
+        solved_states: dict[str, np.ndarray] | None = None
+        for epoch in range(self.optimisation_epochs):
+            if epoch % 2 == 1 and solved_states is not None:
+                usage = np.zeros((length,), dtype=np.float32)
+                for appliance_name in self.appliance_order:
+                    usage += np.sum(solved_states[appliance_name] @ self.means_vector[appliance_name], axis=1)
+                residual = (aggregate_sequence.flatten() - usage).reshape(-1, 1)
+                sigma = np.where(np.abs(residual) < self.sigma_floor, self.sigma_floor, np.abs(residual))
+                continue
+
+            term_3 = 0
+            term_4 = 0
+            for idx in range(length):
+                term_4 += 0.5 * ((aggregate_sequence[idx][0] - total_usage[idx][0]) ** 2 / (sigma[idx][0] ** 2))
+                term_3 += 0.5 * np.log(sigma[idx][0] ** 2)
+
+            objective = cvx.Minimize(term_1 + term_2 + term_3 + term_4)
+            problem = cvx.Problem(objective, constraints)
+            problem.solve(solver=self.solver, verbose=False, warm_start=True)
+            solved_states = {
+                appliance_name: state_vectors[appliance_name].value
+                for appliance_name in self.appliance_order
+            }
+
+        if solved_states is None:
+            raise RuntimeError("AFHMM optimisation failed to produce a state solution.")
+
+        prediction_dict = {}
+        for appliance_name in self.appliance_order:
+            prediction_dict[appliance_name] = np.sum(
+                solved_states[appliance_name] @ self.means_vector[appliance_name],
+                axis=1,
+            ).astype(np.float32)
+        return pd.DataFrame(prediction_dict, dtype="float32")
+
+    def disaggregate_joint(self, grouped_test_data: dict[str, ClassicalGroup]) -> dict[str, pd.DataFrame]:
+        predictions: dict[str, pd.DataFrame] = {}
+        for group_id, group in grouped_test_data.items():
+            predictions[group_id] = self._solve_group(group.aggregate)
+        return predictions
 
     def get_state(self) -> dict[str, Any]:
-        return self._serialise_arrays(
+        return _serialise_value(
             {
-                "appliance_means": self.appliance_means,
-                "background_means": self.background_means,
-                "appliance_log_transitions": self.appliance_log_transitions,
-                "background_log_transitions": self.background_log_transitions,
-                "appliance_log_prior": self.appliance_log_prior,
-                "background_log_prior": self.background_log_prior,
+                "appliance_order": self.appliance_order,
+                "means_vector": self.means_vector,
+                "pi_vector": self.pi_vector,
+                "transmat_vector": self.transmat_vector,
+                "signal_aggregates": self.signal_aggregates,
             }
         )
 
     def set_state(self, state: dict[str, Any]) -> None:
-        state = self._deserialise_arrays(state)
-        self.appliance_means = state["appliance_means"]
-        self.background_means = state["background_means"]
-        self.appliance_log_transitions = state["appliance_log_transitions"]
-        self.background_log_transitions = state["background_log_transitions"]
-        self.appliance_log_prior = state["appliance_log_prior"]
-        self.background_log_prior = state["background_log_prior"]
-
-
-@register_model("afhmm_sac", aliases=("AFHMM-SAC",), display_name="AFHMM_SAC")
-class AFHMMSACBaseline(AFHMMBaseline):
-    display_name = "AFHMM_SAC"
-
-    def __init__(self, *, window_size: int = 599, smoothness_weight: float = 0.05, **kwargs):
-        super().__init__(window_size=window_size, smoothness_weight=smoothness_weight, **kwargs)
-        self.smoothness_weight = smoothness_weight
-
-    def _project_signal(self, base_prediction: np.ndarray, aggregate_sequence: np.ndarray) -> np.ndarray:
-        aggregate_sequence = np.asarray(aggregate_sequence, dtype=np.float32).reshape(-1)
-        base_prediction = np.asarray(base_prediction, dtype=np.float32).reshape(-1)
-
-        try:
-            import cvxpy as cp
-
-            variable = cp.Variable(base_prediction.size)
-            objective = cp.Minimize(
-                cp.sum_squares(variable - base_prediction)
-                + self.smoothness_weight * cp.sum_squares(variable[1:] - variable[:-1])
-            )
-            constraints = [variable >= 0, variable <= aggregate_sequence]
-            problem = cp.Problem(objective, constraints)
-            problem.solve(solver=cp.OSQP, warm_start=True, verbose=False)
-            if variable.value is not None:
-                return np.asarray(variable.value, dtype=np.float32)
-        except Exception:
-            pass
-
-        clipped = np.clip(base_prediction, 0.0, aggregate_sequence)
-        if clipped.size < 3:
-            return clipped
-        kernel = np.array([0.25, 0.5, 0.25], dtype=np.float32)
-        padded = np.pad(clipped, (1, 1), mode="edge")
-        smoothed = np.convolve(padded, kernel, mode="valid")
-        return np.clip(smoothed, 0.0, aggregate_sequence)
-
-    def disaggregate(self, inputs: np.ndarray) -> np.ndarray:
-        base_predictions = super().disaggregate(inputs)
-        refined = [
-            self._project_signal(base_prediction, aggregate_window)
-            for base_prediction, aggregate_window in zip(base_predictions, _ensure_2d(inputs))
-        ]
-        return np.vstack(refined)
+        restored = _deserialise_value(state)
+        self.appliance_order = list(restored["appliance_order"])
+        self.means_vector = dict(restored["means_vector"])
+        self.pi_vector = dict(restored["pi_vector"])
+        self.transmat_vector = dict(restored["transmat_vector"])
+        self.signal_aggregates = {
+            key: float(value) for key, value in restored.get("signal_aggregates", {}).items()
+        }
