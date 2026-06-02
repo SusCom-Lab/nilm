@@ -63,6 +63,10 @@ class Evaluator:
         self.raw_target = None if target_series is None else np.asarray(target_series, dtype=np.float32)
 
         if test_loader is None and test_csv_dir is not None and not self.joint_mode:
+            if self.normalisation_params is None:
+                raise ValueError(
+                    "Evaluator requires training normalisation_params or a checkpoint containing normalisation_stats."
+                )
             test_dataset = SlidingWindowDataset(
                 [test_csv_dir],
                 self.model.get_window_size(),

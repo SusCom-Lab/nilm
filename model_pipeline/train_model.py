@@ -130,6 +130,7 @@ class Trainer:
         batch_size=256,
         device=None,
         model_init_kwargs=None,
+        normalisation_stats=None,
     ):
         set_random_seed(seed)
         model_init_kwargs = dict(model_init_kwargs or {})
@@ -150,7 +151,7 @@ class Trainer:
         self.seed = seed
         self.train_csv_dirs = train_csv_dirs
         self.joint_classical_data = None
-        self.normalisation_stats = None
+        self.normalisation_stats = None if normalisation_stats is None else dict(normalisation_stats)
 
         if getattr(self.model, "supports_gradient", False):
             self.model.to(self.device)
@@ -231,6 +232,8 @@ class Trainer:
         appliance_name = self.appliance_name_formatted
         if getattr(self.model, "is_joint_model", lambda: False)():
             appliance_name = "multi_appliance"
+        if not getattr(self.model, "is_joint_model", lambda: False)() and self.normalisation_stats is None:
+            raise ValueError("Checkpointing requires training normalisation_stats for non-joint models.")
         checkpoint = {
             "model_name": self.model_name,
             "model_key": getattr(self.model, "_registry_key", self.model_name),
