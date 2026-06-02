@@ -29,6 +29,7 @@ class SlidingWindowDataset(Dataset):
         self.data = []
         self.normalisation_params = {}
         self.normalisation_stats = None if normalisation_stats is None else dict(normalisation_stats)
+        self.window_locations = []
 
         split_dfs = []
         for file in file_dirs:
@@ -48,14 +49,33 @@ class SlidingWindowDataset(Dataset):
         for file, df in split_dfs:
             print(f"  Normalising {len(df)} rows.")
             normalised_df = df.copy()
+            aggregate_column = normalised_df.columns[1]
+            appliance_column = normalised_df.columns[2]
+            normalised_df[aggregate_column] = pd.to_numeric(normalised_df[aggregate_column], errors="coerce").astype(np.float32)
+            normalised_df[appliance_column] = pd.to_numeric(normalised_df[appliance_column], errors="coerce").astype(np.float32)
             stats = dict(self.normalisation_stats)
             normalised_df.iloc[:, 1] = (normalised_df.iloc[:, 1] - stats["aggregate_mean"]) / stats["aggregate_std"]
             normalised_df.iloc[:, 2] = (normalised_df.iloc[:, 2] - stats["appliance_mean"]) / stats["appliance_std"]
 
             self.normalisation_params[file] = stats
-            inputs = torch.tensor(normalised_df.iloc[:, 1].to_numpy(), dtype=torch.float32)
-            outputs = torch.tensor(normalised_df.iloc[:, 2].to_numpy(), dtype=torch.float32)
-            self.data.append((inputs, outputs))
+            if "segment_id" in normalised_df.columns:
+                grouped_segments = normalised_df.groupby("segment_id", sort=False)
+            else:
+                grouped_segments = [(0, normalised_df)]
+
+            for _, segment_df in grouped_segments:
+                segment_indices = segment_df.index.to_numpy()
+                segment_df = segment_df.reset_index(drop=True)
+                if len(segment_df) < max(self.window_size, self.output_offset + self.output_size):
+                    continue
+
+                inputs = torch.tensor(segment_df.iloc[:, 1].to_numpy(), dtype=torch.float32)
+                outputs = torch.tensor(segment_df.iloc[:, 2].to_numpy(), dtype=torch.float32)
+                self.data.append((inputs, outputs, segment_indices))
+                self.window_locations.extend(
+                    int(segment_indices[start_idx])
+                    for start_idx in range(self._num_windows(inputs))
+                )
 
     def _select_split(self, df, split_ratio, split_mode):
         if split_ratio is None or split_mode is None:
@@ -96,7 +116,7 @@ class SlidingWindowDataset(Dataset):
         return 0
 
     def __len__(self):
-        return sum(self._num_windows(inputs) for inputs, _ in self.data)
+        return len(self.window_locations)
 
     def getNormalisationParams(self, file_dir):
         return self.normalisation_params.get(file_dir, dict(self.normalisation_stats))
@@ -117,8 +137,11 @@ class SlidingWindowDataset(Dataset):
         last_required_index = max(self.window_size, self.output_offset + self.output_size)
         return max(0, inputs_length - last_required_index + 1)
 
+    def get_window_locations(self):
+        return list(self.window_locations)
+
     def __getitem__(self, idx):
-        for inputs, outputs in self.data:
+        for inputs, outputs, _ in self.data:
             num_windows = self._num_windows(inputs)
             if idx < num_windows:
                 start_idx = idx
@@ -136,6 +159,7 @@ def reconstruct_series_from_windows(
     target_mode: str,
     output_offset: int,
     output_size: int,
+    window_start_indices: list[int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     predictions = np.asarray(window_predictions, dtype=np.float32)
     if predictions.ndim == 1:
@@ -144,7 +168,10 @@ def reconstruct_series_from_windows(
     accumulator = np.zeros(total_length, dtype=np.float32)
     counts = np.zeros(total_length, dtype=np.float32)
 
-    for start_idx, predicted_window in enumerate(predictions):
+    if window_start_indices is None:
+        window_start_indices = list(range(len(predictions)))
+
+    for start_idx, predicted_window in zip(window_start_indices, predictions):
         if target_mode == "point":
             target_idx = start_idx + output_offset
             if 0 <= target_idx < total_length:

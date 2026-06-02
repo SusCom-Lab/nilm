@@ -1,6 +1,8 @@
-import pandas as pd
 import os
 import json
+
+from dataset_management.export.csv_exporter import CSVExporter
+from dataset_management.repair.file_repairer import FileRepairer
 
 class DatasetManager:
     def __init__(self, data_directory, save_path, dataset, appliance_name, debug=False, max_num_houses = None, max_num_rows = 1 * (10**6)):
@@ -19,6 +21,8 @@ class DatasetManager:
         self.max_num_rows = max_num_rows
 
         self.house_data_map = self.loadData()
+        self.repairer = FileRepairer()
+        self.exporter = CSVExporter()
     
     def getHouses(self):
         """
@@ -26,6 +30,19 @@ class DatasetManager:
         """
         appliance_mappings_dir = os.path.join("dataset_management","data_separation", f"{self.dataset}_appliance_mappings.json")
         houses = []
+        if not os.path.exists(appliance_mappings_dir):
+            for name in sorted(os.listdir(self.data_directory)):
+                if not name.startswith("House_"):
+                    continue
+                house_number = int(name.split("_", 1)[1])
+                appliance_file = os.path.join(
+                    self.data_directory,
+                    name,
+                    f"{self.appliance_name_formatted}_H{house_number}.h5",
+                )
+                if os.path.exists(appliance_file):
+                    houses.append(house_number)
+            return houses
         with open(appliance_mappings_dir, 'r') as f:
             appliance_mappings = json.load(f)
         for house in appliance_mappings:
@@ -44,7 +61,7 @@ class DatasetManager:
 
     def loadData(self):
         """
-        Load data for all houses and create a mapping of house number to DataFrame.
+        Load data file paths for all houses.
         """
         house_data_map = {}
 
@@ -56,62 +73,36 @@ class DatasetManager:
 
             if not os.path.exists(aggregate_file) or not os.path.exists(appliance_file):
                 continue
-
-            # Load data
-            aggregate_data = pd.read_hdf(aggregate_file)
-            appliance_data = pd.read_hdf(appliance_file)
-
-            aggregate_data['time'] = pd.to_datetime(aggregate_data['time'])
-
-            aggregate_data.set_index('time', inplace=True)
-            appliance_data.set_index('time', inplace=True)
-            # Merge the aggregate and appliance data on timestamp and resample to 6 seconds
-            merged_data = aggregate_data.join(appliance_data, how='outer')
-            merged_data.index = pd.to_datetime(merged_data.index)
-            merged_data = merged_data.resample('6S').mean().bfill(limit=1)
-            merged_data.dropna(inplace=True)
-            merged_data.reset_index(inplace=True)
-            filtered_data = self.selectBestChunk(merged_data)
-            house_data_map[house] = filtered_data
+            house_data_map[house] = {
+                "aggregate_file": aggregate_file,
+                "appliance_file": appliance_file,
+            }
         return house_data_map
 
-    def selectBestChunk(self, df, gap_threshold=300):
-
-        df = df.copy()  
-        
-        df['time'] = pd.to_datetime(df['time'])
-
-        time_diffs = df['time'].diff().fillna(pd.Timedelta(seconds=0)).dt.total_seconds()
-        window_size = min(self.max_num_rows, int(len(df)*0.3))
-        # Find the index of the largest gap in the data
-        rolling_max_gaps = time_diffs.rolling(window=window_size, min_periods=1).max().shift(-window_size + 1)
-
-        average_nonzero_ratio = (df[self.appliance_name_formatted] != 0).mean()
-
-        rolling_nonzero_ratios = (df[self.appliance_name_formatted] != 0).rolling(window=window_size, min_periods=1).mean().shift(-window_size + 1)
-
-        if self.debug:
-            print(f"Average non-zero ratio: {average_nonzero_ratio}")
-        
-        valid_chunks = (rolling_max_gaps < gap_threshold) & (rolling_nonzero_ratios >= average_nonzero_ratio)
-
-        if valid_chunks.any():
-            print("Valid chunks found")
-            best_chunk_index = valid_chunks.idxmax()
-            best_chunk = df.loc[best_chunk_index:best_chunk_index + window_size]
-        else:
-            print("No valid chunks found")
-            best_start_index = rolling_max_gaps.idxmin()
-            best_chunk = df.loc[best_start_index:best_start_index + window_size]
- 
-        return best_chunk
-
     def createData(self):
+        repaired_root = os.path.join(self.save_path, "_repaired_cache")
         for house in self.houses:
-            data = self.house_data_map[house]
+            if house not in self.house_data_map:
+                continue
             os.makedirs(self.save_path, exist_ok=True)
+            house_dir = os.path.join(repaired_root, f"House_{house}")
+            os.makedirs(house_dir, exist_ok=True)
+
+            aggregate_input = self.house_data_map[house]["aggregate_file"]
+            appliance_input = self.house_data_map[house]["appliance_file"]
+            aggregate_repaired = os.path.join(house_dir, f"aggregate_H{house}.h5")
+            appliance_repaired = os.path.join(house_dir, f"{self.appliance_name_formatted}_H{house}.h5")
+
+            self.repairer.repair_file(aggregate_input, self.dataset, aggregate_repaired)
+            self.repairer.repair_file(appliance_input, self.dataset, appliance_repaired)
+
             output_file = os.path.join(self.save_path, f'{self.appliance_name_formatted}_H{house}.csv')
-            data.to_csv(output_file, index=False)
+            self.exporter.export_house_appliance(
+                aggregate_repaired,
+                appliance_repaired,
+                self.dataset,
+                output_file,
+            )
 
         
 

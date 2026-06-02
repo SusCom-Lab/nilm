@@ -6,6 +6,8 @@ import os
 from datetime import datetime
 import re
 
+from dataset_management.data_separation.standard_h5_adapter import StandardH5Adapter
+
 class DataSeparator:
     """
     Class to separate energy dataset data by appliance for each house.
@@ -33,6 +35,7 @@ class DataSeparator:
         self.mapping_file = os.path.join("dataset_management","data_separation",f"{dataset_type.lower()}_appliance_mappings.json")
         self.output_dir = os.path.join(save_path, f'{dataset_type.upper()}_data_separated')
         os.makedirs(self.output_dir, exist_ok=True)
+        self.standard_h5_adapter = StandardH5Adapter()
 
     def load_mappings(self):
         try:
@@ -45,6 +48,10 @@ class DataSeparator:
         return {}
 
     def process_data(self):
+        if self.dataset_type == "STANDARD_H5":
+            self.standard_h5_adapter.export_to_separated_files(self.file_path, self.output_dir)
+            return
+
         appliance_mapping = self.load_mappings()
         print(f"Processing data for dataset: {self.dataset_type}")
         num_houses_processed = 0

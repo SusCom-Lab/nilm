@@ -77,6 +77,9 @@ class Evaluator:
             )
             test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
             self.normalisation_params = test_dataset.getNormalisationParams(test_csv_dir)
+            self.window_start_indices = test_dataset.get_window_locations()
+        else:
+            self.window_start_indices = None
 
         self.test_loader = test_loader
         if getattr(self.model, "supports_gradient", False):
@@ -208,6 +211,7 @@ class Evaluator:
             target_mode=self.model.get_target_type(),
             output_offset=self.model.get_output_offset(),
             output_size=self.model.get_output_size(),
+            window_start_indices=self.window_start_indices,
         )
         valid_mask = coverage > 0
 
