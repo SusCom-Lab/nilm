@@ -78,6 +78,7 @@ def build_windowed_loaders(
         output_size=output_size,
         output_offset=output_offset,
     )
+    normalisation_stats = train_dataset.get_normalisation_stats()
     validation_dataset = SlidingWindowDataset(
         csv_paths,
         window_size,
@@ -86,6 +87,7 @@ def build_windowed_loaders(
         target_mode=target_mode,
         output_size=output_size,
         output_offset=output_offset,
+        normalisation_stats=normalisation_stats,
     )
 
     generator = torch.Generator()
@@ -104,7 +106,7 @@ def build_windowed_loaders(
         shuffle=False,
         worker_init_fn=get_worker_init_fn(seed),
     )
-    return train_loader, validation_loader
+    return train_loader, validation_loader, normalisation_stats
 
 
 class Trainer:
@@ -148,6 +150,7 @@ class Trainer:
         self.seed = seed
         self.train_csv_dirs = train_csv_dirs
         self.joint_classical_data = None
+        self.normalisation_stats = None
 
         if getattr(self.model, "supports_gradient", False):
             self.model.to(self.device)
@@ -160,7 +163,7 @@ class Trainer:
                 and getattr(self.model, "is_joint_model", lambda: False)()
             )
         ):
-            train_loader, validation_loader = build_windowed_loaders(
+            train_loader, validation_loader, normalisation_stats = build_windowed_loaders(
                 train_csv_dirs,
                 window_size=self.model.get_window_size(),
                 target_mode=self.model.get_target_type(),
@@ -170,6 +173,7 @@ class Trainer:
                 val_ratio=val_ratio,
                 seed=seed,
             )
+            self.normalisation_stats = normalisation_stats
 
         self.train_loader = train_loader
         self.validation_loader = validation_loader
@@ -238,6 +242,7 @@ class Trainer:
             "dataset": self.dataset,
             "init_kwargs": self.model.get_init_kwargs(),
             "model_state": self.model.export_state(),
+            "normalisation_stats": self.normalisation_stats,
         }
         if getattr(self.model, "is_joint_model", lambda: False)():
             checkpoint["joint_mode"] = True

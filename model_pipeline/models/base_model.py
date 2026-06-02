@@ -39,7 +39,7 @@ class BaseNILMModel(ABC):
 
     def _default_output_offset(self) -> int:
         if self.target_type == "point":
-            return max(0, (self.window_size // 2) - 1)
+            return self.window_size // 2
         return 0
 
     def get_window_size(self) -> int:

@@ -50,13 +50,14 @@ class Evaluator:
         self.appliance_name_formatted = (checkpoint or {}).get("appliance", "appliance")
         self.joint_mode = bool((checkpoint or {}).get("joint_mode", False))
         self.joint_appliances = list((checkpoint or {}).get("appliances", []))
+        checkpoint_normalisation = (checkpoint or {}).get("normalisation_stats")
 
         self.result_dir = result_dir or os.path.join("result", self.dataset, self.appliance_name_formatted)
         os.makedirs(self.result_dir, exist_ok=True)
 
         self.batch_size = batch_size
         self.test_csv_dir = test_csv_dir
-        self.normalisation_params = normalisation_params
+        self.normalisation_params = normalisation_params or checkpoint_normalisation
         self.raw_timestamps = None if timestamps is None else pd.Series(timestamps).reset_index(drop=True)
         self.raw_aggregate = None if aggregate_series is None else np.asarray(aggregate_series, dtype=np.float32)
         self.raw_target = None if target_series is None else np.asarray(target_series, dtype=np.float32)
@@ -68,6 +69,7 @@ class Evaluator:
                 target_mode=self.model.get_target_type(),
                 output_size=self.model.get_output_size(),
                 output_offset=self.model.get_output_offset(),
+                normalisation_stats=self.normalisation_params,
             )
             test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
             self.normalisation_params = test_dataset.getNormalisationParams(test_csv_dir)

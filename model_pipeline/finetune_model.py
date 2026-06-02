@@ -27,7 +27,7 @@ class Finetuner:
         if hasattr(self.model, "freeze_for_finetuning"):
             self.model.freeze_for_finetuning()
 
-        train_loader, _ = build_windowed_loaders(
+        train_loader, _, _ = build_windowed_loaders(
             [finetune_csv_dir],
             window_size=self.model.get_window_size(),
             target_mode=self.model.get_target_type(),

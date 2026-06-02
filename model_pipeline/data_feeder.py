@@ -19,48 +19,74 @@ class SlidingWindowDataset(Dataset):
         target_mode="point",
         output_size=None,
         output_offset=None,
+        normalisation_stats=None,
     ):
         self.window_size = int(window_size)
         self.target_mode = target_mode
         self.output_size = int(output_size or (1 if target_mode == "point" else self.window_size))
-        self.center_index = max(0, (self.window_size // 2) - 1)
+        self.center_index = self.window_size // 2
         self.output_offset = self._resolve_output_offset(output_offset)
         self.data = []
         self.normalisation_params = {}
+        self.normalisation_stats = None if normalisation_stats is None else dict(normalisation_stats)
 
-        all_dfs = []
+        split_dfs = []
         for file in file_dirs:
             print(f"Loading data: {os.path.basename(file)} ...")
-            house_params = {}
             df = pd.read_csv(file)
-            print(f"  Loaded {len(df)} rows. Normalising ...")
+            print(f"  Loaded {len(df)} rows.")
             if crop:
                 df = df.head(crop)
+            split_df = self._select_split(df, split_ratio, split_mode)
+            split_dfs.append((file, split_df.reset_index(drop=True)))
 
-            house_params["aggregate_mean"] = df.iloc[:, 1].mean()
-            house_params["aggregate_std"] = df.iloc[:, 1].std()
-            house_params["appliance_mean"] = df.iloc[:, 2].mean()
-            house_params["appliance_std"] = df.iloc[:, 2].std()
+        if self.normalisation_stats is None:
+            self.normalisation_stats = self._compute_normalisation_stats(
+                [df for _, df in split_dfs if not df.empty]
+            )
 
-            df.iloc[:, 1] = (df.iloc[:, 1] - house_params["aggregate_mean"]) / house_params["aggregate_std"]
-            df.iloc[:, 2] = (df.iloc[:, 2] - house_params["appliance_mean"]) / house_params["appliance_std"]
+        for file, df in split_dfs:
+            print(f"  Normalising {len(df)} rows.")
+            normalised_df = df.copy()
+            stats = dict(self.normalisation_stats)
+            normalised_df.iloc[:, 1] = (normalised_df.iloc[:, 1] - stats["aggregate_mean"]) / stats["aggregate_std"]
+            normalised_df.iloc[:, 2] = (normalised_df.iloc[:, 2] - stats["appliance_mean"]) / stats["appliance_std"]
 
-            self.normalisation_params[file] = house_params
-            all_dfs.append(df)
+            self.normalisation_params[file] = stats
+            inputs = torch.tensor(normalised_df.iloc[:, 1].to_numpy(), dtype=torch.float32)
+            outputs = torch.tensor(normalised_df.iloc[:, 2].to_numpy(), dtype=torch.float32)
+            self.data.append((inputs, outputs))
 
-        merged_df = pd.concat(all_dfs, ignore_index=True)
+    def _select_split(self, df, split_ratio, split_mode):
+        if split_ratio is None or split_mode is None:
+            return df.copy()
 
-        if split_ratio is not None and split_mode is not None:
-            total_rows = len(merged_df)
-            split_index = int(total_rows * split_ratio)
-            if split_mode == "train":
-                merged_df = merged_df.iloc[:split_index]
-            elif split_mode == "val":
-                merged_df = merged_df.iloc[split_index:]
+        total_rows = len(df)
+        split_index = int(total_rows * split_ratio)
+        if split_mode == "train":
+            return df.iloc[:split_index].copy()
+        if split_mode == "val":
+            return df.iloc[split_index:].copy()
+        return df.copy()
 
-        inputs = torch.tensor(merged_df.iloc[:, 1].values, dtype=torch.float32)
-        outputs = torch.tensor(merged_df.iloc[:, 2].values, dtype=torch.float32)
-        self.data.append((inputs, outputs))
+    def _safe_std(self, value):
+        value = float(value)
+        if not np.isfinite(value) or value == 0.0:
+            return 1.0
+        return value
+
+    def _compute_normalisation_stats(self, dfs):
+        if not dfs:
+            raise ValueError("Cannot compute normalisation statistics from empty data.")
+
+        aggregate_values = pd.concat([df.iloc[:, 1] for df in dfs], ignore_index=True)
+        appliance_values = pd.concat([df.iloc[:, 2] for df in dfs], ignore_index=True)
+        return {
+            "aggregate_mean": float(aggregate_values.mean()),
+            "aggregate_std": self._safe_std(aggregate_values.std()),
+            "appliance_mean": float(appliance_values.mean()),
+            "appliance_std": self._safe_std(appliance_values.std()),
+        }
 
     def _resolve_output_offset(self, output_offset):
         if output_offset is not None:
@@ -73,7 +99,10 @@ class SlidingWindowDataset(Dataset):
         return sum(self._num_windows(inputs) for inputs, _ in self.data)
 
     def getNormalisationParams(self, file_dir):
-        return self.normalisation_params[file_dir]
+        return self.normalisation_params.get(file_dir, dict(self.normalisation_stats))
+
+    def get_normalisation_stats(self):
+        return dict(self.normalisation_stats)
 
     def _slice_targets(self, outputs, start_idx):
         if self.target_mode == "point":
