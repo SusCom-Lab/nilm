@@ -464,7 +464,7 @@ time,aggregate,dishwasher
 
 ## 7. 训练接口对接要求
 
-为兼容当前仓库中的 `DatasetManager` 和 `SlidingWindowDataset`，当前默认导出应满足：
+为兼容当前仓库中的 `SlidingWindowDataset`，当前默认导出应满足：
 
 1. 每户目录中至少有 `aggregate_Hx.h5` 和目标电器 `xxx_Hx.h5`
 2. 两个文件都包含 `time` 列
@@ -503,7 +503,7 @@ time,aggregate,dishwasher
 
 本规范与当前仓库现状保持兼容，并参考以下来源：
 
-1. 本仓库现有 `DataSeparator`、`DatasetManager`、`DatasetRegistry`、`SlidingWindowDataset` 的行为约束
+1. 本仓库现有 `DataSeparator`、`SlidingWindowDataset` 的行为约束
 2. `NILMFormer` 预处理思路：统一重采样、有限前向填充、小值归零、功率裁剪、按电器阈值生成状态
 
 ## 10. 示例说明
