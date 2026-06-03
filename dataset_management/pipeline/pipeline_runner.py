@@ -17,7 +17,13 @@ class PipelineRunner:
         self.repairer = FileRepairer()
         self.exporter = CSVExporter()
 
-    def run(self, dataset_type: str, input_path: str, workspace_dir: str) -> dict:
+    def run(
+        self,
+        dataset_type: str,
+        input_path: str,
+        workspace_dir: str,
+        appliance_name: str | None = None,
+    ) -> dict:
         dataset_key = dataset_type.upper()
         separated_root = os.path.join(workspace_dir, "separated")
         repaired_root = os.path.join(workspace_dir, "repaired")
@@ -28,6 +34,7 @@ class PipelineRunner:
             file_path=input_path,
             save_path=separated_root,
             dataset_type=dataset_key,
+            appliance_name=appliance_name,
         )
         separator.process_data()
         separated_dir = separator.output_dir

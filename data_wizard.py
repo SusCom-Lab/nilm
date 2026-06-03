@@ -38,13 +38,22 @@ def runFullDataPipeline():
     input_path = input("Enter the input path (raw dataset path or STANDARD_H5 file path): ")
     workspace_dir = input("Enter the workspace/output directory: ")
     dataset_type = input("Enter the dataset type: ")
+    appliance = input("Enter the appliance to filter for (press enter to process all): ")
 
     if dataset_type.lower() not in DATASET_TYPES:
         print("Invalid dataset type. Please try again.")
         return
 
+    if not appliance.strip():
+        appliance = None
+
     runner = PipelineRunner()
-    summary = runner.run(dataset_type=dataset_type, input_path=input_path, workspace_dir=workspace_dir)
+    summary = runner.run(
+        dataset_type=dataset_type,
+        input_path=input_path,
+        workspace_dir=workspace_dir,
+        appliance_name=appliance,
+    )
 
     print("Pipeline completed.")
     print(f"Separated data: {summary['separated_dir']}")
