@@ -81,6 +81,17 @@ class SlidingWindowDataset(Dataset):
         if split_ratio is None or split_mode is None:
             return df.copy()
 
+        if "segment_id" in df.columns:
+            segment_ids = df["segment_id"].drop_duplicates()
+            split_index = int(len(segment_ids) * split_ratio)
+            if split_mode == "train":
+                selected_segments = segment_ids.iloc[:split_index]
+            elif split_mode == "val":
+                selected_segments = segment_ids.iloc[split_index:]
+            else:
+                return df.copy()
+            return df[df["segment_id"].isin(selected_segments)].copy()
+
         total_rows = len(df)
         split_index = int(total_rows * split_ratio)
         if split_mode == "train":

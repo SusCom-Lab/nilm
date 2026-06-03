@@ -210,6 +210,8 @@ def trainModelCLI():
 
     num_epochs = _safe_int_input("Number of epochs", 10)
     val_ratio = _safe_float_input("Validation ratio", 0.2)
+    crop_value = input("Crop rows per CSV for quick runs (press enter for full data): ").strip()
+    crop = int(crop_value) if crop_value else None
     seed = _safe_int_input("Random seed", 42)
 
     trainer = train_model.Trainer(
@@ -221,6 +223,7 @@ def trainModelCLI():
         window_length=input_window_length,
         val_ratio=val_ratio,
         seed=seed,
+        crop=crop,
         model_init_kwargs=model_init_kwargs,
     )
     trainer.trainModel(num_epochs)

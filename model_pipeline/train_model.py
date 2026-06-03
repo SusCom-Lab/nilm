@@ -64,6 +64,7 @@ def build_windowed_loaders(
     target_mode,
     output_size,
     output_offset,
+    crop=None,
     batch_size=256,
     val_ratio=0.2,
     seed=42,
@@ -72,6 +73,7 @@ def build_windowed_loaders(
     train_dataset = SlidingWindowDataset(
         csv_paths,
         window_size,
+        crop=crop,
         split_ratio=train_split_ratio,
         split_mode="train",
         target_mode=target_mode,
@@ -82,6 +84,7 @@ def build_windowed_loaders(
     validation_dataset = SlidingWindowDataset(
         csv_paths,
         window_size,
+        crop=crop,
         split_ratio=train_split_ratio,
         split_mode="val",
         target_mode=target_mode,
@@ -128,6 +131,7 @@ class Trainer:
         result_dir=None,
         seed=42,
         batch_size=256,
+        crop=None,
         device=None,
         model_init_kwargs=None,
         normalisation_stats=None,
@@ -149,6 +153,7 @@ class Trainer:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.batch_size = batch_size
         self.seed = seed
+        self.crop = crop
         self.train_csv_dirs = train_csv_dirs
         self.joint_classical_data = None
         self.normalisation_stats = None if normalisation_stats is None else dict(normalisation_stats)
@@ -170,6 +175,7 @@ class Trainer:
                 target_mode=self.model.get_target_type(),
                 output_size=self.model.get_output_size(),
                 output_offset=self.model.get_output_offset(),
+                crop=crop,
                 batch_size=batch_size,
                 val_ratio=val_ratio,
                 seed=seed,
