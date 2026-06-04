@@ -82,8 +82,24 @@ class SlidingWindowDataset(Dataset):
             return df.copy()
 
         if "segment_id" in df.columns:
-            segment_ids = df["segment_id"].drop_duplicates()
-            split_index = int(len(segment_ids) * split_ratio)
+            segment_sizes = (
+                df.groupby("segment_id", sort=False)
+                .size()
+                .reset_index(name="rows")
+            )
+            target_rows = len(df) * split_ratio
+            cumulative_rows = segment_sizes["rows"].cumsum()
+            split_index = int((cumulative_rows < target_rows).sum())
+            if split_index < len(segment_sizes):
+                current_gap = abs(cumulative_rows.iloc[split_index] - target_rows)
+                previous_gap = abs(
+                    (cumulative_rows.iloc[split_index - 1] if split_index > 0 else 0) - target_rows
+                )
+                if previous_gap < current_gap:
+                    split_index -= 1
+
+            split_index = max(0, min(len(segment_sizes), split_index + 1))
+            segment_ids = segment_sizes["segment_id"]
             if split_mode == "train":
                 selected_segments = segment_ids.iloc[:split_index]
             elif split_mode == "val":

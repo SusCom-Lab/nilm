@@ -401,10 +401,19 @@ class Evaluator:
             return
 
         results_df["time"] = pd.to_datetime(results_df["time"])
+        plot_df = results_df.copy()
+        time_diffs = plot_df["time"].diff()
+        if len(plot_df) > 1:
+            reference_gap = time_diffs.dropna().min()
+            if pd.notna(reference_gap):
+                gap_threshold = reference_gap * 2
+                gap_mask = time_diffs > gap_threshold
+                plot_df.loc[gap_mask, ["aggregate", "ground truth", "prediction"]] = np.nan
+
         plt.figure(figsize=(30, 6))
-        plt.plot(results_df["time"], results_df["aggregate"], label="Aggregate", alpha=0.7)
-        plt.plot(results_df["time"], results_df["ground truth"], label="Ground Truth", alpha=0.7)
-        plt.plot(results_df["time"], results_df["prediction"], label="Prediction", alpha=0.7)
+        plt.plot(plot_df["time"], plot_df["aggregate"], label="Aggregate", alpha=0.7)
+        plt.plot(plot_df["time"], plot_df["ground truth"], label="Ground Truth", alpha=0.7)
+        plt.plot(plot_df["time"], plot_df["prediction"], label="Prediction", alpha=0.7)
         plt.title(f"Prediction Plot for {self.appliance_name_formatted} using {self.model_name}")
         plt.xlabel("Timestamp")
         plt.ylabel("Power (Watts)")
