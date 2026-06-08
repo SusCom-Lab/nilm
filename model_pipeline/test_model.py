@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 
 import matplotlib.pyplot as plt
@@ -9,12 +10,160 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from sklearn.metrics import average_precision_score, precision_recall_curve, precision_recall_fscore_support
 from torch.utils.data import DataLoader
 
 from model_pipeline.classical_data import load_grouped_classical_data
 from model_pipeline.data_feeder import SlidingWindowDataset, reconstruct_series_from_windows
 from model_pipeline.model_registry import instantiate_from_checkpoint, load_checkpoint
 from model_pipeline.train_model import compute_metrics
+
+
+STATUS_RULES_FILE = os.path.join(os.path.dirname(__file__), "appliance_status_rules.json")
+STATUS_METRIC_COLUMNS = {
+    "Precision": np.nan,
+    "Recall": np.nan,
+    "F1-score": np.nan,
+    "PR-AUC": np.nan,
+    "status_threshold": np.nan,
+    "status_positive_ratio": np.nan,
+}
+_STATUS_RULES_CACHE = None
+
+
+def _normalise_appliance_name(name):
+    value = str(name or "").strip()
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    value = re.sub(r"[^0-9A-Za-z]+", "_", value).strip("_").lower()
+    return value
+
+
+def _load_status_rules():
+    global _STATUS_RULES_CACHE
+    if _STATUS_RULES_CACHE is None:
+        try:
+            with open(STATUS_RULES_FILE, "r", encoding="utf-8") as handle:
+                raw_rules = json.load(handle)
+        except Exception:
+            raw_rules = {}
+        _STATUS_RULES_CACHE = {
+            _normalise_appliance_name(appliance): dict(rule)
+            for appliance, rule in raw_rules.items()
+        }
+    return _STATUS_RULES_CACHE
+
+
+def _get_status_rule(appliance_name):
+    rules = _load_status_rules()
+    normalised = _normalise_appliance_name(appliance_name)
+    if normalised in rules:
+        return rules[normalised]
+
+    compact = normalised.replace("_", "")
+    for rule_name, rule in rules.items():
+        if rule_name.replace("_", "") == compact:
+            return rule
+    return None
+
+
+def _infer_sample_period_seconds(timestamps):
+    try:
+        time_values = pd.to_datetime(pd.Series(timestamps), errors="coerce").dropna()
+        diffs = time_values.sort_values().diff().dropna().dt.total_seconds()
+        diffs = diffs[diffs > 0]
+        if not diffs.empty:
+            sample_period = float(diffs.median())
+            if np.isfinite(sample_period) and sample_period > 0:
+                return sample_period
+    except Exception:
+        pass
+    return 1.0
+
+
+def _duration_to_samples(duration_seconds, sample_period_seconds):
+    duration = float(duration_seconds or 0)
+    sample_period = float(sample_period_seconds or 1.0)
+    if duration <= 0:
+        return 0
+    if not np.isfinite(sample_period) or sample_period <= 0:
+        sample_period = 1.0
+    return max(1, int(np.ceil(duration / sample_period)))
+
+
+def _iter_runs(status):
+    if len(status) == 0:
+        return
+
+    start = 0
+    current = int(status[0])
+    for idx in range(1, len(status)):
+        value = int(status[idx])
+        if value != current:
+            yield start, idx, current
+            start = idx
+            current = value
+    yield start, len(status), current
+
+
+def _apply_duration_rules(status, rule, sample_period_seconds):
+    filtered = np.asarray(status, dtype=np.int8).copy()
+    min_off_samples = _duration_to_samples(rule.get("min_off_duration", 0), sample_period_seconds)
+    min_on_samples = _duration_to_samples(rule.get("min_on_duration", 0), sample_period_seconds)
+
+    if min_off_samples > 0:
+        for start, end, value in list(_iter_runs(filtered)):
+            if value == 0 and start > 0 and end < len(filtered) and (end - start) < min_off_samples:
+                filtered[start:end] = 1
+
+    if min_on_samples > 0:
+        for start, end, value in list(_iter_runs(filtered)):
+            if value == 1 and (end - start) < min_on_samples:
+                filtered[start:end] = 0
+
+    return filtered
+
+
+def _power_to_status(power, rule, timestamps):
+    values = np.asarray(power, dtype=np.float32)
+    min_threshold = float(rule["min_threshold"])
+    max_threshold = float(rule.get("max_threshold", np.inf))
+    initial_status = ((values >= min_threshold) & (values <= max_threshold)).astype(np.int8)
+    sample_period = _infer_sample_period_seconds(timestamps)
+    return _apply_duration_rules(initial_status, rule, sample_period)
+
+
+def _compute_status_metrics(prediction, ground_truth, timestamps, appliance_name):
+    rule = _get_status_rule(appliance_name)
+    metrics = dict(STATUS_METRIC_COLUMNS)
+    if rule is None:
+        return metrics, None, None, None
+
+    y_true = _power_to_status(ground_truth, rule, timestamps)
+    y_pred = _power_to_status(prediction, rule, timestamps)
+    precision, recall, f1_score, _ = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        average="binary",
+        zero_division=0,
+    )
+
+    metrics.update(
+        {
+            "Precision": float(precision),
+            "Recall": float(recall),
+            "F1-score": float(f1_score),
+            "status_threshold": float(rule["min_threshold"]),
+            "status_positive_ratio": float(np.mean(y_true)) if len(y_true) else np.nan,
+        }
+    )
+
+    unique_true = np.unique(y_true)
+    if len(unique_true) > 1:
+        y_score = np.asarray(prediction, dtype=np.float32)
+        metrics["PR-AUC"] = float(average_precision_score(y_true, y_score))
+        return metrics, y_true, y_score, rule
+
+    return metrics, y_true, np.asarray(prediction, dtype=np.float32), rule
 
 
 class Evaluator:
@@ -148,6 +297,12 @@ class Evaluator:
                     )
                     ground_truth = np.clip(group.appliances[appliance_name], 0.0, None)
                     metrics = compute_metrics(prediction, ground_truth)
+                    status_metrics, _, _, _ = _compute_status_metrics(
+                        prediction,
+                        ground_truth,
+                        group.time,
+                        appliance_name,
+                    )
                     metric_rows.append(
                         {
                             "group": group_id,
@@ -157,6 +312,7 @@ class Evaluator:
                             "MAE": metrics["MAE"],
                             "SAE": metrics["SAE"],
                             "inference_time": self.dt,
+                            **status_metrics,
                         }
                     )
             self.joint_metrics = pd.DataFrame(metric_rows)
@@ -256,6 +412,12 @@ class Evaluator:
             return self.joint_metrics
 
         mae, sae, dt = self.getMetrics()
+        status_metrics, _, _, _ = _compute_status_metrics(
+            self.predictions,
+            self.ground_truth,
+            self.timestamps,
+            self.appliance_name_formatted,
+        )
         metrics_df = pd.DataFrame(
             {
                 "appliance": [self.appliance_name_formatted],
@@ -264,6 +426,7 @@ class Evaluator:
                 "MAE": [mae],
                 "SAE": [sae],
                 "inference_time": [dt],
+                **{name: [value] for name, value in status_metrics.items()},
             }
         )
         metrics_filename = f"{self.appliance_name_formatted}_{self.model_name}_metrics.csv"
@@ -454,7 +617,41 @@ class Evaluator:
         results_path = os.path.join(self.result_dir, results_filename)
         results_df.to_csv(results_path, index=False)
         print(f"Results CSV saved to {results_path}")
+        self._plot_pr_curve(results_df)
         self.saveMetrics()
+
+    def _plot_pr_curve(self, results_df):
+        status_metrics, y_true, y_score, _ = _compute_status_metrics(
+            results_df["prediction"].to_numpy(dtype=np.float32),
+            results_df["ground truth"].to_numpy(dtype=np.float32),
+            results_df["time"],
+            self.appliance_name_formatted,
+        )
+        if y_true is None or y_score is None:
+            print(f"PR curve skipped: no status rule for {self.appliance_name_formatted}.")
+            return
+        if len(np.unique(y_true)) < 2:
+            print(f"PR curve skipped: ground truth status has only one class for {self.appliance_name_formatted}.")
+            return
+
+        precision, recall, _ = precision_recall_curve(y_true, y_score)
+        pr_auc = status_metrics["PR-AUC"]
+
+        plt.figure(figsize=(6, 5))
+        plt.plot(recall, precision, label=f"PR-AUC: {pr_auc:.3f}")
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.title(f"PR Curve for {self.appliance_name_formatted} using {self.model_name}")
+        plt.xlim(0.0, 1.0)
+        plt.ylim(0.0, 1.05)
+        plt.legend(loc="lower left")
+        plt.tight_layout()
+
+        plot_filename = f"pr_curve_{self.appliance_name_formatted}_{self.model_name}.png"
+        plot_path = os.path.join(self.result_dir, plot_filename)
+        plt.savefig(plot_path, bbox_inches="tight", dpi=300)
+        plt.close()
+        print(f"PR curve saved to {plot_path}")
 
 
 class _nullcontext:

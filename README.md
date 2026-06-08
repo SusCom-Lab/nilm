@@ -99,10 +99,10 @@ nilm-baseline/
 
 | Dataset | Format | Source |
 |---------|--------|--------|
-| **UKDALE** | HDF5 (`.h5`) | [Download](https://data.ukedc.rl.ac.uk/cgi-bin/data_browser/browse/edc/efficiency/residential/EnergyConsumption/Domestic/UK-DALE-2017/UK-DALE-FULL-disaggregated/ukdale.h5.zip) |
-| **REDD** | HDF5 (`.h5`) | [Download](https://tokhub.github.io/dbecd/links/redd.html) |
+| **UKDALE** | HDF5 (`.h5`) | [CEDA / UK-DALE data browser](https://data.ceda.ac.uk/edc) |
+| **REDD** | HDF5 (`.h5`) | Original REDD download links are often unavailable; use a local `redd.h5` converted with NILMTK or another accessible REDD mirror |
 | **REFIT** | CSV (CLEAN_House*.csv) | [Download](https://pureportal.strath.ac.uk/en/datasets/refit-electrical-load-measurements-cleaned) |
-| **ECO** | CSV (unzipped smart meter + plug data) | Requires pre-processing: unzip smart meter and plug-level data into a single folder |
+| **ECO** | CSV (unzipped smart meter + plug data) | [Download](https://vs.inf.ethz.ch/res/show.html?what=eco-data), then unzip smart meter and plug-level data into a single folder |
 
 Use `data_wizard.py` to process raw data into training-ready CSV files:
 
