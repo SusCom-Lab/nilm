@@ -20,12 +20,18 @@ class SlidingWindowDataset(Dataset):
         output_size=None,
         output_offset=None,
         normalisation_stats=None,
+        appliance_on_threshold=None,
+        min_on_points=1,
+        min_on_rate=0.0,
     ):
         self.window_size = int(window_size)
         self.target_mode = target_mode
         self.output_size = int(output_size or (1 if target_mode == "point" else self.window_size))
         self.center_index = self.window_size // 2
         self.output_offset = self._resolve_output_offset(output_offset)
+        self.appliance_on_threshold = appliance_on_threshold
+        self.min_on_points = int(min_on_points)
+        self.min_on_rate = float(min_on_rate)
         self.data = []
         self.normalisation_params = {}
         self.normalisation_stats = None if normalisation_stats is None else dict(normalisation_stats)
@@ -53,9 +59,11 @@ class SlidingWindowDataset(Dataset):
             appliance_column = normalised_df.columns[2]
             normalised_df[aggregate_column] = pd.to_numeric(normalised_df[aggregate_column], errors="coerce").astype(np.float32)
             normalised_df[appliance_column] = pd.to_numeric(normalised_df[appliance_column], errors="coerce").astype(np.float32)
+            raw_appliance_values = normalised_df[appliance_column].copy()
             stats = dict(self.normalisation_stats)
             normalised_df.iloc[:, 1] = (normalised_df.iloc[:, 1] - stats["aggregate_mean"]) / stats["aggregate_std"]
             normalised_df.iloc[:, 2] = (normalised_df.iloc[:, 2] - stats["appliance_mean"]) / stats["appliance_std"]
+            normalised_df["_raw_appliance_for_window_filter"] = raw_appliance_values
 
             self.normalisation_params[file] = stats
             if "segment_id" in normalised_df.columns:
@@ -69,13 +77,18 @@ class SlidingWindowDataset(Dataset):
                 if len(segment_df) < max(self.window_size, self.output_offset + self.output_size):
                     continue
 
+                raw_appliance_values = segment_df["_raw_appliance_for_window_filter"].to_numpy(dtype=np.float32)
+                if not self._segment_passes_on_filter(raw_appliance_values):
+                    continue
+
                 inputs = torch.tensor(segment_df.iloc[:, 1].to_numpy(), dtype=torch.float32)
                 outputs = torch.tensor(segment_df.iloc[:, 2].to_numpy(), dtype=torch.float32)
-                self.data.append((inputs, outputs, segment_indices))
-                self.window_locations.extend(
-                    int(segment_indices[start_idx])
-                    for start_idx in range(self._num_windows(inputs))
-                )
+                window_starts = list(range(self._num_windows(inputs)))
+                if len(window_starts) == 0:
+                    continue
+
+                self.data.append((inputs, outputs, segment_indices, window_starts))
+                self.window_locations.extend(int(segment_indices[start_idx]) for start_idx in window_starts)
 
     def _select_split(self, df, split_ratio, split_mode):
         if split_ratio is None or split_mode is None:
@@ -164,15 +177,27 @@ class SlidingWindowDataset(Dataset):
         last_required_index = max(self.window_size, self.output_offset + self.output_size)
         return max(0, inputs_length - last_required_index + 1)
 
+    def _segment_passes_on_filter(self, raw_appliance_values):
+        if self.appliance_on_threshold is None:
+            return True
+
+        threshold = float(self.appliance_on_threshold)
+        on_points = int((raw_appliance_values > threshold).sum())
+        if on_points < max(1, self.min_on_points):
+            return False
+        if self.min_on_rate > 0 and on_points / len(raw_appliance_values) < self.min_on_rate:
+            return False
+        return True
+
     def get_window_locations(self):
         return list(self.window_locations)
 
     def __getitem__(self, idx):
-        for inputs, outputs, _ in self.data:
-            num_windows = self._num_windows(inputs)
+        for inputs, outputs, _, window_starts in self.data:
+            num_windows = len(window_starts)
             if idx < num_windows:
-                start_idx = idx
-                end_idx = idx + self.window_size
+                start_idx = window_starts[idx]
+                end_idx = start_idx + self.window_size
                 return inputs[start_idx:end_idx], self._slice_targets(outputs, start_idx)
             idx -= num_windows
 

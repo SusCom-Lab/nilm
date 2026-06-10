@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import random
 from typing import Any
 
@@ -15,6 +16,30 @@ from torch.utils.data import DataLoader
 from model_pipeline.classical_data import load_grouped_classical_data
 from model_pipeline.data_feeder import SlidingWindowDataset
 from model_pipeline.model_registry import create_model
+
+
+STATUS_RULES_FILE = os.path.join(os.path.dirname(__file__), "appliance_status_rules.json")
+
+
+def resolve_appliance_filter_settings(appliance, appliance_on_threshold, min_on_rate):
+    if not appliance:
+        return appliance_on_threshold, 0.0 if min_on_rate is None else min_on_rate
+
+    try:
+        with open(STATUS_RULES_FILE, "r", encoding="utf-8") as handle:
+            rules = json.load(handle)
+    except FileNotFoundError:
+        return appliance_on_threshold, 0.0 if min_on_rate is None else min_on_rate
+
+    rule = rules.get(str(appliance).replace(" ", "_").lower())
+    if not rule:
+        return appliance_on_threshold, 0.0 if min_on_rate is None else min_on_rate
+
+    if appliance_on_threshold is None:
+        appliance_on_threshold = rule.get("segment_filter_threshold", rule.get("min_threshold"))
+    if min_on_rate is None:
+        min_on_rate = rule.get("min_on_rate", 0.0)
+    return appliance_on_threshold, min_on_rate
 
 
 def set_random_seed(seed=42):
@@ -68,6 +93,9 @@ def build_windowed_loaders(
     batch_size=256,
     val_ratio=0.2,
     seed=42,
+    appliance_on_threshold=None,
+    min_on_points=1,
+    min_on_rate=0.0,
 ):
     train_split_ratio = 1 - val_ratio
     train_dataset = SlidingWindowDataset(
@@ -79,6 +107,9 @@ def build_windowed_loaders(
         target_mode=target_mode,
         output_size=output_size,
         output_offset=output_offset,
+        appliance_on_threshold=appliance_on_threshold,
+        min_on_points=min_on_points,
+        min_on_rate=min_on_rate,
     )
     normalisation_stats = train_dataset.get_normalisation_stats()
     validation_dataset = SlidingWindowDataset(
@@ -91,6 +122,9 @@ def build_windowed_loaders(
         output_size=output_size,
         output_offset=output_offset,
         normalisation_stats=normalisation_stats,
+        appliance_on_threshold=appliance_on_threshold,
+        min_on_points=min_on_points,
+        min_on_rate=min_on_rate,
     )
 
     generator = torch.Generator()
@@ -135,6 +169,9 @@ class Trainer:
         device=None,
         model_init_kwargs=None,
         normalisation_stats=None,
+        appliance_on_threshold=None,
+        min_on_points=1,
+        min_on_rate=None,
     ):
         set_random_seed(seed)
         model_init_kwargs = dict(model_init_kwargs or {})
@@ -157,6 +194,11 @@ class Trainer:
         self.train_csv_dirs = train_csv_dirs
         self.joint_classical_data = None
         self.normalisation_stats = None if normalisation_stats is None else dict(normalisation_stats)
+        appliance_on_threshold, min_on_rate = resolve_appliance_filter_settings(
+            self.appliance_name_formatted,
+            appliance_on_threshold,
+            min_on_rate,
+        )
 
         if getattr(self.model, "supports_gradient", False):
             self.model.to(self.device)
@@ -179,6 +221,9 @@ class Trainer:
                 batch_size=batch_size,
                 val_ratio=val_ratio,
                 seed=seed,
+                appliance_on_threshold=appliance_on_threshold,
+                min_on_points=min_on_points,
+                min_on_rate=min_on_rate,
             )
             self.normalisation_stats = normalisation_stats
 

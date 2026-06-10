@@ -16,6 +16,11 @@ class DataSeparator:
         self.file_path = file_path
         self.save_path = save_path
         self.appliance_name = appliance_name.lower() if appliance_name else None
+        self.appliance_names = {
+            name.strip().lower()
+            for name in self.appliance_name.split(",")
+            if name.strip()
+        } if self.appliance_name else None
         self.dataset_type = dataset_type.upper()
         self.num_houses = num_houses
 
@@ -62,7 +67,7 @@ class DataSeparator:
             if self.dataset_type == 'ECO':
                 self._process_eco_aggregate_data(house_number)
             for channel, appliance in channels.items():
-                if self.appliance_name and self.appliance_name != appliance.lower() and appliance != 'aggregate':
+                if self.appliance_names and appliance.lower() not in self.appliance_names and appliance != 'aggregate':
                     continue
 
                 print(f"Processing data for House {house_number}, Appliance: {appliance}")
@@ -156,7 +161,7 @@ class DataSeparator:
         num_rows=86400
         base_date = file_name.split(".")[0]
         start_time = pd.to_datetime(base_date)
-        return pd.date_range(start=start_time, periods=num_rows, freq='S')
+        return pd.date_range(start=start_time, periods=num_rows, freq='s')
 
     def _process_eco_aggregate_data(self, house_number):
         print(f"Processing aggregate data for ECO, House {house_number}")
