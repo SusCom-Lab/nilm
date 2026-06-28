@@ -132,6 +132,14 @@ def _power_to_status(power, rule, timestamps):
     return _apply_duration_rules(initial_status, rule, sample_period)
 
 
+def _prediction_to_status(power, rule):
+    values = np.asarray(power, dtype=np.float32).copy()
+    min_threshold = float(rule["min_threshold"])
+    max_threshold = float(rule.get("max_threshold", np.inf))
+    values[values < min_threshold] = 0
+    return ((values > min_threshold) & (values <= max_threshold)).astype(np.int8)
+
+
 def _compute_status_metrics(prediction, ground_truth, timestamps, appliance_name):
     rule = _get_status_rule(appliance_name)
     metrics = dict(STATUS_METRIC_COLUMNS)
@@ -139,7 +147,7 @@ def _compute_status_metrics(prediction, ground_truth, timestamps, appliance_name
         return metrics, None, None, None
 
     y_true = _power_to_status(ground_truth, rule, timestamps)
-    y_pred = _power_to_status(prediction, rule, timestamps)
+    y_pred = _prediction_to_status(prediction, rule)
     precision, recall, f1_score, _ = precision_recall_fscore_support(
         y_true,
         y_pred,
