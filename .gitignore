@@ -9,6 +9,6 @@ __pycache__/
 *.pyc
 *.log
 # 忽略所有数据文件
-*.json
-*.csv
-*.h5
+dataset/
+# 忽略所有doc文件
+docs/
