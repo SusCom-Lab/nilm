@@ -1,2 +1,0 @@
-checkpoint,test_csv,appliance,raw_threshold,decision_threshold,num_windows,Precision,Recall,F1,FPR,PR-AUC,TP,FP,TN,FN,positive_ratio
-saved_models/state_aware_official_dishwasher_exported_h1_h2_300k_w0p03/dishwasher_ukdale_exported_h1_h2_dishwasher_300k_StateAwareSeq2Point.pth,dataset/ukdale/exported_csv/UKDALE_dataset/dishwasher_H2.csv,dishwasher,10.0,0.5,1718426.0,0.5046016397265927,0.533729292775954,0.5187569162670602,0.016577746533495585,0.5822822554843483,28127.0,27614.0,1638113.0,24572.0,0.030667017375202655
