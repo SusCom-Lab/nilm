@@ -248,6 +248,7 @@ class Trainer:
         self.counter = 0
         self.train_losses = []
         self.val_losses = []
+        self.selection_losses = []
 
     def _prepare_torch_batch(self, inputs, targets):
         inputs = inputs.to(self.device)
@@ -270,6 +271,14 @@ class Trainer:
         outputs = self.model(inputs)
         outputs = self.model.prepare_outputs(outputs)
         return self.criterion(outputs, targets), outputs
+
+    def _torch_selection_loss(self, inputs, targets):
+        hook = getattr(self.model, "compute_selection_loss", None)
+        if callable(hook):
+            return hook(inputs, targets, criterion=self.criterion)
+
+        loss, _ = self._torch_loss(inputs, targets)
+        return loss
 
     def _collect_numpy_loader(self, loader):
         all_inputs = []
@@ -367,24 +376,32 @@ class Trainer:
             train_loss /= max(1, len(self.train_loader))
 
             val_loss = train_loss
+            selection_loss = val_loss
             if self.validation_loader is not None:
                 self.model.eval()
                 val_loss = 0.0
+                selection_loss = 0.0
                 with torch.no_grad():
                     for inputs, targets in self.validation_loader:
                         inputs, targets = self._prepare_torch_batch(inputs, targets)
                         loss, _ = self._torch_loss(inputs, targets)
                         val_loss += loss.item()
+                        selection_loss += self._torch_selection_loss(inputs, targets).item()
                 val_loss /= max(1, len(self.validation_loader))
+                selection_loss /= max(1, len(self.validation_loader))
 
-            print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss}, Val Loss: {val_loss}")
+            print(
+                f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss}, "
+                f"Val Loss: {val_loss}, Selection Loss: {selection_loss}"
+            )
 
             self.train_losses.append(train_loss)
             self.val_losses.append(val_loss)
-            self.scheduler.step(val_loss)
+            self.selection_losses.append(selection_loss)
+            self.scheduler.step(selection_loss)
 
-            if val_loss < self.best_val_loss - self.min_delta:
-                self.best_val_loss = val_loss
+            if selection_loss < self.best_val_loss - self.min_delta:
+                self.best_val_loss = selection_loss
                 checkpoint_path = self._save_checkpoint()
                 print(f"Validation improved. Checkpoint saved to {checkpoint_path}")
                 self.counter = 0

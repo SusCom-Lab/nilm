@@ -142,9 +142,15 @@ class DataSeparator:
                     data['aggregate'] = data.iloc[:,1:].sum(axis=1)
                     data.drop(columns=['aggregate_1', 'aggregate_2'], inplace=True)
                 else:
-                    key = f'/building{house_number}/elec/meter{channel}'
-                    df = store.get(key)
-                    data = pd.DataFrame({'time': df.index, appliance_column: df.values.flatten()})
+                    meter_ids = [meter.strip() for meter in str(channel).split(",")]
+                    meter_frames = []
+                    for meter_id in meter_ids:
+                        key = f'/building{house_number}/elec/meter{meter_id}'
+                        df = store.get(key)
+                        meter_frames.append(pd.Series(df.values.flatten(), index=df.index))
+
+                    combined = pd.concat(meter_frames, axis=1).sum(axis=1, min_count=1)
+                    data = pd.DataFrame({'time': combined.index, appliance_column: combined.values})
             data.dropna(inplace=True)
             data['time'] = data['time'].astype(str).apply(lambda x: x.rsplit('-',1)[0])
             self._save_data(house_number, appliance_column, data)

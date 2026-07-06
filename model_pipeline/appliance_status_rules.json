@@ -1,0 +1,47 @@
+{
+  "kettle": {
+    "status_threshold": 2000,
+    "min_threshold": 2000,
+    "segment_filter_threshold": 2000,
+    "min_on_rate": 0.01,
+    "max_threshold": 3100,
+    "min_on_duration": 10,
+    "min_off_duration": 0
+  },
+  "fridge": {
+    "status_threshold": 50,
+    "min_threshold": 50,
+    "segment_filter_threshold": 50,
+    "min_on_rate": 0.5,
+    "max_threshold": 300,
+    "min_on_duration": 60,
+    "min_off_duration": 10
+  },
+  "washing_machine": {
+    "status_threshold": 20,
+    "min_threshold": 20,
+    "segment_filter_threshold": 20,
+    "min_on_rate": 0.05,
+    "max_threshold": 2500,
+    "min_on_duration": 1800,
+    "min_off_duration": 160
+  },
+  "microwave": {
+    "status_threshold": 200,
+    "min_threshold": 200,
+    "segment_filter_threshold": 200,
+    "min_on_rate": 0.008,
+    "max_threshold": 3000,
+    "min_on_duration": 10,
+    "min_off_duration": 30
+  },
+  "dishwasher": {
+    "status_threshold": 10,
+    "min_threshold": 10,
+    "segment_filter_threshold": 10,
+    "min_on_rate": 0.03,
+    "max_threshold": 2500,
+    "min_on_duration": 1800,
+    "min_off_duration": 1800
+  }
+}
