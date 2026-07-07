@@ -96,6 +96,7 @@ def build_windowed_loaders(
     appliance_on_threshold=None,
     min_on_points=1,
     min_on_rate=0.0,
+    status_column=None,
 ):
     train_split_ratio = 1 - val_ratio
     train_dataset = SlidingWindowDataset(
@@ -110,6 +111,7 @@ def build_windowed_loaders(
         appliance_on_threshold=appliance_on_threshold,
         min_on_points=min_on_points,
         min_on_rate=min_on_rate,
+        status_column=status_column,
     )
     normalisation_stats = train_dataset.get_normalisation_stats()
     validation_dataset = SlidingWindowDataset(
@@ -125,6 +127,7 @@ def build_windowed_loaders(
         appliance_on_threshold=appliance_on_threshold,
         min_on_points=min_on_points,
         min_on_rate=min_on_rate,
+        status_column=status_column,
     )
 
     generator = torch.Generator()

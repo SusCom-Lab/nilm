@@ -23,6 +23,7 @@ class SlidingWindowDataset(Dataset):
         appliance_on_threshold=None,
         min_on_points=1,
         min_on_rate=0.0,
+        status_column=None,
     ):
         self.window_size = int(window_size)
         self.target_mode = target_mode
@@ -32,6 +33,7 @@ class SlidingWindowDataset(Dataset):
         self.appliance_on_threshold = appliance_on_threshold
         self.min_on_points = int(min_on_points)
         self.min_on_rate = float(min_on_rate)
+        self.status_column = status_column
         self.data = []
         self.normalisation_params = {}
         self.normalisation_stats = None if normalisation_stats is None else dict(normalisation_stats)
@@ -57,8 +59,13 @@ class SlidingWindowDataset(Dataset):
             normalised_df = df.copy()
             aggregate_column = normalised_df.columns[1]
             appliance_column = normalised_df.columns[2]
+            if self.status_column is not None and self.status_column not in normalised_df.columns:
+                raise ValueError(f"CSV is missing required status column: {self.status_column}")
+            status_column = self.status_column
             normalised_df[aggregate_column] = pd.to_numeric(normalised_df[aggregate_column], errors="coerce").astype(np.float32)
             normalised_df[appliance_column] = pd.to_numeric(normalised_df[appliance_column], errors="coerce").astype(np.float32)
+            if status_column is not None:
+                normalised_df[status_column] = pd.to_numeric(normalised_df[status_column], errors="coerce").fillna(0).astype(np.float32)
             raw_appliance_values = normalised_df[appliance_column].copy()
             stats = dict(self.normalisation_stats)
             normalised_df.iloc[:, 1] = (normalised_df.iloc[:, 1] - stats["aggregate_mean"]) / stats["aggregate_std"]
@@ -83,11 +90,14 @@ class SlidingWindowDataset(Dataset):
 
                 inputs = torch.tensor(segment_df.iloc[:, 1].to_numpy(), dtype=torch.float32)
                 outputs = torch.tensor(segment_df.iloc[:, 2].to_numpy(), dtype=torch.float32)
+                status_outputs = None
+                if status_column is not None:
+                    status_outputs = torch.tensor(segment_df[status_column].to_numpy(), dtype=torch.float32)
                 window_starts = list(range(self._num_windows(inputs)))
                 if len(window_starts) == 0:
                     continue
 
-                self.data.append((inputs, outputs, segment_indices, window_starts))
+                self.data.append((inputs, outputs, status_outputs, segment_indices, window_starts))
                 self.window_locations.extend(int(segment_indices[start_idx]) for start_idx in window_starts)
 
     def _select_split(self, df, split_ratio, split_mode):
@@ -193,12 +203,16 @@ class SlidingWindowDataset(Dataset):
         return list(self.window_locations)
 
     def __getitem__(self, idx):
-        for inputs, outputs, _, window_starts in self.data:
+        for inputs, outputs, status_outputs, _, window_starts in self.data:
             num_windows = len(window_starts)
             if idx < num_windows:
                 start_idx = window_starts[idx]
                 end_idx = start_idx + self.window_size
-                return inputs[start_idx:end_idx], self._slice_targets(outputs, start_idx)
+                target = self._slice_targets(outputs, start_idx)
+                if status_outputs is not None:
+                    status_target = self._slice_targets(status_outputs, start_idx)
+                    target = torch.stack((target.reshape(()), status_target.reshape(())))
+                return inputs[start_idx:end_idx], target
             idx -= num_windows
 
         raise IndexError("Index out of range")

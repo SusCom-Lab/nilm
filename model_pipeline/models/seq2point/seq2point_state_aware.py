@@ -74,6 +74,16 @@ class StateAwareSeq2Point(TorchNILMModel):
         self.state_head = nn.Linear(hidden_dim, 1)
         self.last_state_logits: torch.Tensor | None = None
 
+    def prepare_targets(self, targets):
+        if isinstance(targets, torch.Tensor) and self.target_type == "point" and targets.ndim == 2 and targets.size(-1) == 2:
+            return targets.float()
+        return super().prepare_targets(targets)
+
+    def _split_targets(self, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if targets.ndim == 2 and targets.size(-1) == 2:
+            return targets[:, 0].reshape(-1), targets[:, 1].reshape(-1).float()
+        raise ValueError("StateAwareSeq2Point requires targets with [power, status].")
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         x = x.unsqueeze(1)
         return self.representation(self.encoder(x))
@@ -86,10 +96,10 @@ class StateAwareSeq2Point(TorchNILMModel):
         z = self.encode(inputs)
         outputs = self.power_head(z)
         prepared_outputs = self.prepare_outputs(outputs)
-        prepared_targets = self.prepare_targets(targets)
+        prepared_targets, provided_state_targets = self._split_targets(targets)
 
         power_loss = criterion(prepared_outputs, prepared_targets)
-        state_targets = power_to_status(prepared_targets, self.state_threshold).to(device=inputs.device)
+        state_targets = provided_state_targets.to(device=inputs.device)
         state_logits = self.state_head(z).reshape(-1)
         self.last_state_logits = state_logits
 
@@ -101,5 +111,5 @@ class StateAwareSeq2Point(TorchNILMModel):
 
     def compute_selection_loss(self, inputs: torch.Tensor, targets: torch.Tensor, criterion) -> torch.Tensor:
         outputs = self.prepare_outputs(self(inputs))
-        prepared_targets = self.prepare_targets(targets)
+        prepared_targets, _ = self._split_targets(targets)
         return criterion(outputs, prepared_targets)

@@ -140,13 +140,15 @@ def _prediction_to_status(power, rule):
     return ((values > min_threshold) & (values <= max_threshold)).astype(np.int8)
 
 
-def _compute_status_metrics(prediction, ground_truth, timestamps, appliance_name):
+def _compute_status_metrics(prediction, ground_truth, timestamps, appliance_name, true_status):
     rule = _get_status_rule(appliance_name)
     metrics = dict(STATUS_METRIC_COLUMNS)
     if rule is None:
         return metrics, None, None, None
+    if true_status is None:
+        raise ValueError("Status metrics require a 'status' column in the evaluation CSV.")
 
-    y_true = _power_to_status(ground_truth, rule, timestamps)
+    y_true = np.asarray(true_status, dtype=np.int8)
     y_pred = _prediction_to_status(prediction, rule)
     precision, recall, f1_score, _ = precision_recall_fscore_support(
         y_true,
@@ -247,6 +249,7 @@ class Evaluator:
         self.ground_truth = []
         self.aggregate = []
         self.timestamps = pd.Series(dtype=object)
+        self.true_status = None
         self.joint_results: dict[str, pd.DataFrame] = {}
         self.joint_metrics = pd.DataFrame()
         self._joint_grouped_data = None
@@ -310,6 +313,7 @@ class Evaluator:
                         ground_truth,
                         group.time,
                         appliance_name,
+                        None,
                     )
                     metric_rows.append(
                         {
@@ -334,6 +338,9 @@ class Evaluator:
             raw_timestamps = raw_df.iloc[:, 0].reset_index(drop=True)
             raw_aggregate = raw_df.iloc[:, 1].astype(float).to_numpy()
             raw_target = raw_df.iloc[:, 2].astype(float).to_numpy()
+            if "status" not in raw_df.columns:
+                raise ValueError("Evaluation CSV is missing required 'status' column.")
+            raw_status = raw_df["status"].astype(float).to_numpy()
         else:
             if self.raw_timestamps is None or self.raw_aggregate is None or self.raw_target is None:
                 raise ValueError(
@@ -342,6 +349,7 @@ class Evaluator:
             raw_timestamps = self.raw_timestamps
             raw_aggregate = self.raw_aggregate
             raw_target = self.raw_target
+            raw_status = None
         total_length = len(raw_target)
 
         if self.normalisation_params is None:
@@ -382,6 +390,7 @@ class Evaluator:
         self.timestamps = raw_timestamps[valid_mask].reset_index(drop=True)
         self.aggregate = np.clip(raw_aggregate[valid_mask], 0.0, None).tolist()
         self.ground_truth = np.clip(raw_target[valid_mask], 0.0, None).tolist()
+        self.true_status = None if raw_status is None else raw_status[valid_mask].astype(np.int8).tolist()
         predictions = np.clip(reconstructed[valid_mask], 0.0, None)
         predictions = np.minimum(predictions, np.asarray(self.aggregate, dtype=np.float32))
         self.predictions = predictions.tolist()
@@ -396,14 +405,15 @@ class Evaluator:
     def getResults(self):
         if self.joint_mode:
             return dict(self.joint_results)
-        return pd.DataFrame(
-            {
-                "time": self.timestamps,
-                "aggregate": self.aggregate,
-                "prediction": self.predictions,
-                "ground truth": self.ground_truth,
-            }
-        )
+        data = {
+            "time": self.timestamps,
+            "aggregate": self.aggregate,
+            "prediction": self.predictions,
+            "ground truth": self.ground_truth,
+        }
+        if self.true_status is not None:
+            data["status"] = self.true_status
+        return pd.DataFrame(data)
 
     def getMetrics(self):
         if self.joint_mode:
@@ -425,6 +435,7 @@ class Evaluator:
             self.ground_truth,
             self.timestamps,
             self.appliance_name_formatted,
+            self.true_status,
         )
         metrics_df = pd.DataFrame(
             {
@@ -629,11 +640,13 @@ class Evaluator:
         self.saveMetrics()
 
     def _plot_pr_curve(self, results_df):
+        true_status = results_df["status"].to_numpy(dtype=np.int8) if "status" in results_df.columns else self.true_status
         status_metrics, y_true, y_score, _ = _compute_status_metrics(
             results_df["prediction"].to_numpy(dtype=np.float32),
             results_df["ground truth"].to_numpy(dtype=np.float32),
             results_df["time"],
             self.appliance_name_formatted,
+            true_status,
         )
         if y_true is None or y_score is None:
             print(f"PR curve skipped: no status rule for {self.appliance_name_formatted}.")
