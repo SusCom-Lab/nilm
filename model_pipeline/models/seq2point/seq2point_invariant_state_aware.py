@@ -99,7 +99,7 @@ class InvariantStateAwareSeq2Point(TorchNILMModel):
     def _split_targets(self, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         if targets.ndim == 2 and targets.size(-1) == 2:
             return targets[:, 0].reshape(-1), targets[:, 1].reshape(-1).float()
-        raise ValueError("InvariantStateAwareSeq2Point requires targets with [power, status].")
+        return super().prepare_targets(targets), None
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         x = x.unsqueeze(1)
@@ -123,6 +123,18 @@ class InvariantStateAwareSeq2Point(TorchNILMModel):
         prepared_targets, provided_state_targets = self._split_targets(targets)
 
         power_loss = criterion(prepared_outputs, prepared_targets)
+
+        if provided_state_targets is None:
+            state_loss = torch.zeros((), dtype=power_loss.dtype, device=power_loss.device)
+            house_loss = torch.zeros((), dtype=power_loss.dtype, device=power_loss.device)
+            total_loss = power_loss
+            if house_ids is None:
+                return total_loss, outputs
+            return total_loss, outputs, {
+                "power_loss": power_loss.detach(),
+                "state_loss": state_loss.detach(),
+                "house_loss": house_loss.detach(),
+            }
 
         state_targets = provided_state_targets.to(device=inputs.device)
         state_logits = self.state_head(z).reshape(-1)
