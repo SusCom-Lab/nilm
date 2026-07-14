@@ -25,6 +25,10 @@ STATUS_METRIC_COLUMNS = {
     "Recall": np.nan,
     "F1-score": np.nan,
     "PR-AUC": np.nan,
+    "FPR": np.nan,
+    "MAE_on": np.nan,
+    "MAE_off": np.nan,
+    "BMAE": np.nan,
     "status_threshold": np.nan,
     "status_positive_ratio": np.nan,
 }
@@ -158,12 +162,25 @@ def _compute_status_metrics(prediction, ground_truth, timestamps, appliance_name
         average="binary",
         zero_division=0,
     )
+    false_positives = int(((y_pred == 1) & (y_true == 0)).sum())
+    true_negatives = int(((y_pred == 0) & (y_true == 0)).sum())
+    fpr_denominator = false_positives + true_negatives
+    absolute_errors = np.abs(np.asarray(prediction, dtype=np.float32) - np.asarray(ground_truth, dtype=np.float32))
+    on_mask = y_true == 1
+    off_mask = y_true == 0
+    mae_on = float(np.mean(absolute_errors[on_mask])) if bool(on_mask.any()) else np.nan
+    mae_off = float(np.mean(absolute_errors[off_mask])) if bool(off_mask.any()) else np.nan
+    bmae = float((mae_on + mae_off) / 2.0) if np.isfinite(mae_on) and np.isfinite(mae_off) else np.nan
 
     metrics.update(
         {
             "Precision": float(precision),
             "Recall": float(recall),
             "F1-score": float(f1_score),
+            "FPR": float(false_positives / fpr_denominator) if fpr_denominator else np.nan,
+            "MAE_on": mae_on,
+            "MAE_off": mae_off,
+            "BMAE": bmae,
             "status_threshold": float(rule["min_threshold"]),
             "status_positive_ratio": float(np.mean(y_true)) if len(y_true) else np.nan,
         }
