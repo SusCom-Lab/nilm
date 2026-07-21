@@ -227,8 +227,15 @@ class Trainer:
                 appliance_on_threshold=appliance_on_threshold,
                 min_on_points=min_on_points,
                 min_on_rate=min_on_rate,
+                status_column=(
+                    "status" if getattr(self.model, "requires_status_targets", False) else None
+                ),
             )
             self.normalisation_stats = normalisation_stats
+
+        configure_normalisation = getattr(self.model, "set_normalisation_stats", None)
+        if callable(configure_normalisation) and self.normalisation_stats is not None:
+            configure_normalisation(self.normalisation_stats)
 
         self.train_loader = train_loader
         self.validation_loader = validation_loader

@@ -211,7 +211,10 @@ class SlidingWindowDataset(Dataset):
                 target = self._slice_targets(outputs, start_idx)
                 if status_outputs is not None:
                     status_target = self._slice_targets(status_outputs, start_idx)
-                    target = torch.stack((target.reshape(()), status_target.reshape(())))
+                    if self.target_mode == "point":
+                        target = torch.stack((target.reshape(()), status_target.reshape(())))
+                    else:
+                        target = torch.stack((target, status_target), dim=-1)
                 return inputs[start_idx:end_idx], target
             idx -= num_windows
 

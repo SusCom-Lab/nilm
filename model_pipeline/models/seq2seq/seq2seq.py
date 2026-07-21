@@ -20,6 +20,7 @@ class Seq2SeqCNN(TorchNILMModel):
 
     def __init__(self, *, window_size: int = 599, hidden_dim: int = 1024, **kwargs):
         super().__init__(window_size=window_size, hidden_dim=hidden_dim, **kwargs)
+        self.hidden_dim = int(hidden_dim)
         length = self.window_size
         length = (length - 10) // 2 + 1
         length = (length - 8) // 2 + 1
@@ -36,11 +37,11 @@ class Seq2SeqCNN(TorchNILMModel):
         self.conv5 = nn.Conv1d(50, 50, 5, stride=1)
         self.dropout2 = nn.Dropout(0.2)
         self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(flattened, hidden_dim)
+        self.fc1 = nn.Linear(flattened, self.hidden_dim)
         self.dropout3 = nn.Dropout(0.2)
-        self.fc2 = nn.Linear(hidden_dim, self.window_size)
+        self.fc2 = nn.Linear(self.hidden_dim, self.output_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
         x = x.unsqueeze(-1).permute(0, 2, 1)
         x = torch.relu(self.conv1(x))
         x = torch.relu(self.conv2(x))
@@ -51,5 +52,7 @@ class Seq2SeqCNN(TorchNILMModel):
         x = self.dropout2(x)
         x = self.flatten(x)
         x = torch.relu(self.fc1(x))
-        x = self.dropout3(x)
-        return self.fc2(x)
+        return self.dropout3(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.encode(x))
