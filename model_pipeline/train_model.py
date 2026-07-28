@@ -180,6 +180,7 @@ class Trainer:
         minimum_epochs=1,
         select_epoch_zero=False,
         checkpoint_callback=None,
+        gradient_clip_norm=None,
     ):
         set_random_seed(seed)
         model_init_kwargs = dict(model_init_kwargs or {})
@@ -263,6 +264,11 @@ class Trainer:
             raise ValueError("minimum_epochs must be at least 1.")
         self.select_epoch_zero = bool(select_epoch_zero)
         self.checkpoint_callback = checkpoint_callback
+        self.gradient_clip_norm = (
+            None if gradient_clip_norm is None else float(gradient_clip_norm)
+        )
+        if self.gradient_clip_norm is not None and self.gradient_clip_norm <= 0:
+            raise ValueError("gradient_clip_norm must be positive when provided.")
         self.best_val_loss = float("inf")
         self.best_epoch = None
         self.current_epoch = None
@@ -461,6 +467,15 @@ class Trainer:
                 self.optimizer.zero_grad()
                 loss, _ = self._torch_loss(inputs, targets)
                 loss.backward()
+                if self.gradient_clip_norm is not None:
+                    nn.utils.clip_grad_norm_(
+                        [
+                            parameter
+                            for parameter in self.model.parameters()
+                            if parameter.requires_grad
+                        ],
+                        self.gradient_clip_norm,
+                    )
                 self.optimizer.step()
                 train_loss += loss.item()
 
