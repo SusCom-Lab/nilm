@@ -1,0 +1,39 @@
+{
+  "experiment_name": "refit_washing_machine_seq2point_context_film_sixfold",
+  "base_config": "experiments/configs/refit_washing_machine_seq2point_film_dev.yaml",
+  "artifacts_root": "artifacts/context_film_seq2point_wm_sixfold_seed42",
+  "seed": 42,
+  "excluded_houses": ["H4"],
+  "folds": {
+    "F1": {
+      "train": ["H3", "H5", "H6", "H7"],
+      "validation": ["H2"],
+      "test": ["H1"]
+    },
+    "F2": {
+      "train": ["H1", "H5", "H6", "H7"],
+      "validation": ["H3"],
+      "test": ["H2"]
+    },
+    "F3": {
+      "train": ["H1", "H2", "H5", "H6"],
+      "validation": ["H7"],
+      "test": ["H3"]
+    },
+    "F4": {
+      "train": ["H1", "H2", "H3", "H7"],
+      "validation": ["H6"],
+      "test": ["H5"]
+    },
+    "F5": {
+      "train": ["H1", "H2", "H3", "H7"],
+      "validation": ["H5"],
+      "test": ["H6"]
+    },
+    "F6": {
+      "train": ["H2", "H3", "H5", "H6"],
+      "validation": ["H1"],
+      "test": ["H7"]
+    }
+  }
+}

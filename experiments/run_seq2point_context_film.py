@@ -407,7 +407,9 @@ class Experiment:
         manifest["checkpoints"]["M0"] = str(self.baseline_path.relative_to(REPO_ROOT))
         manifest["best_epochs"]["M0"] = trainer.best_epoch
         manifest["training_history"] = {"M0": trainer.epoch_history}
-        manifest["h6_evaluation_timestamp_policy"] = "H6-B valid Seq2Point center timestamps"
+        manifest["test_evaluation_timestamp_policy"] = (
+            f"{self.config['house_split']['test'][0]}-B valid Seq2Point center timestamps"
+        )
         self._update_manifest(manifest)
         print(f"M0 best epoch: {trainer.best_epoch}; checkpoint: {self.baseline_path}")
 
@@ -828,13 +830,16 @@ class Experiment:
         )
         for name, values in predictions.items():
             prediction_frame[name] = np.minimum(np.clip(values, 0.0, None), np.clip(aggregate, 0.0, None))
-        prediction_frame.to_csv(self.run_dir / "h6_b_predictions.csv", index=False)
+        prediction_frame.to_csv(
+            self.run_dir / f"{test_house.lower()}_b_predictions.csv", index=False
+        )
         leakage_report = {
             "passed": True,
-            "h6_labels_read_after_all_predictions": self.guard.predictions_complete,
-            "h6_not_in_normalisation": test_house not in manifest["normalisation_provenance"]["aggregate"]["houses"]
+            "test_house": test_house,
+            "test_labels_read_after_all_predictions": self.guard.predictions_complete,
+            "test_not_in_normalisation": test_house not in manifest["normalisation_provenance"]["aggregate"]["houses"]
             and test_house not in manifest["normalisation_provenance"]["appliance"]["houses"],
-            "h6_not_in_checkpoint_selection": test_house not in self.config["house_split"]["validation"],
+            "test_not_in_checkpoint_selection": test_house not in self.config["house_split"]["validation"],
             "threshold_source": self.config["evaluation"]["status_rule_source"],
             "wrong_query_house_block": f"{test_house}-B",
             "wrong_query_object_reused": id(query_dataset) == shared_query_identity,
