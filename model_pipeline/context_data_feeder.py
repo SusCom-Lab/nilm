@@ -300,6 +300,53 @@ class HouseholdBalancedBatchSampler(Sampler[list[int]]):
             yield batch
 
 
+class HouseholdUniformBatchSampler(Sampler[list[int]]):
+    """Sample one household uniformly per batch, then sample only its queries."""
+
+    def __init__(
+        self,
+        dataset: MultiHouseQueryDataset,
+        *,
+        batch_size: int,
+        seed: int,
+        epoch_size: int | None = None,
+    ):
+        self.dataset = dataset
+        self.house_ranges = list(dataset.house_ranges.values())
+        self.num_houses = len(self.house_ranges)
+        self.batch_size = int(batch_size)
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be positive.")
+        self.seed = int(seed)
+        default_size = max(len(indices) for indices in self.house_ranges) * self.num_houses
+        self.epoch_size = int(epoch_size or default_size)
+        self.epoch_size -= self.epoch_size % self.batch_size
+        if self.epoch_size < self.batch_size:
+            raise ValueError("epoch_size must contain at least one complete batch.")
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self.epoch_size // self.batch_size
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = np.random.default_rng(self.seed + self.epoch)
+        pools = [rng.permutation(indices) for indices in self.house_ranges]
+        cursors = [0 for _ in self.house_ranges]
+        for _ in range(len(self)):
+            house_index = int(rng.integers(self.num_houses))
+            original = self.house_ranges[house_index]
+            if cursors[house_index] + self.batch_size > len(pools[house_index]):
+                pools[house_index] = rng.permutation(original)
+                cursors[house_index] = 0
+            start = cursors[house_index]
+            batch = pools[house_index][start : start + self.batch_size].tolist()
+            cursors[house_index] += self.batch_size
+            yield batch
+
+
 def timestamp_fingerprint(timestamps: Sequence[object]) -> str:
     import hashlib
 

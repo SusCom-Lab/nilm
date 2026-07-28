@@ -15,3 +15,14 @@ __all__ = [
     "freeze_seq2point",
     "module_sha256",
 ]
+from model_pipeline.models.context_adapter.seq2point_adapter_bank import (
+    BottleneckAdapter,
+    ContextRoutedAdapterBankSeq2Point,
+    GlobalSharedAdapterSeq2Point,
+)
+
+__all__ = [
+    "BottleneckAdapter",
+    "ContextRoutedAdapterBankSeq2Point",
+    "GlobalSharedAdapterSeq2Point",
+]
