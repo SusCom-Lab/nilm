@@ -6,6 +6,9 @@ import numpy as np
 import pandas as pd
 import torch
 
+from experiments.run_seq2point_context_routed_adapter import (
+    HouseholdRoutedTrainerModel,
+)
 from model_pipeline.context_data_feeder import (
     HouseholdUniformBatchSampler,
     MultiHouseQueryDataset,
@@ -139,6 +142,34 @@ class ContextRoutedAdapterTest(unittest.TestCase):
                 if set(batch).issubset(set(indices.tolist()))
             ]
             self.assertEqual(len(containing_houses), 1)
+
+    def test_training_hook_rejects_cross_house_pairing(self):
+        adapter = HouseholdRoutedTrainerModel(
+            self.baseline(),
+            window_size=self.window_size,
+            code_dim=8,
+            bottleneck_dim=4,
+        )
+        contexts = {
+            house: (
+                torch.randn(4, self.window_size),
+                torch.ones(4, dtype=torch.bool),
+            )
+            for house in ("H1", "H2", "H5")
+        }
+        adapter.configure_training_contexts(
+            contexts, ["H1", "H2"], "H5", torch.device("cpu")
+        )
+        inputs, targets = adapter.prepare_batch(
+            (
+                self.query,
+                torch.randn(len(self.query)),
+                torch.tensor([0, 1, 0, 1]),
+            ),
+            device="cpu",
+        )
+        with self.assertRaises(RuntimeError):
+            adapter.compute_loss(inputs, targets, criterion=torch.nn.MSELoss())
 
 
 if __name__ == "__main__":
