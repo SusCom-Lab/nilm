@@ -46,5 +46,13 @@ class Seq2Point(TorchNILMModel):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decode(self.encode(x))
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the last hidden representation without changing legacy weights."""
         x = x.unsqueeze(1)
-        return self.network(x)
+        return self.network[:-1](x)
+
+    def decode(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Apply the original output layer to a hidden representation."""
+        return self.network[-1](hidden)
