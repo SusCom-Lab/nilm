@@ -179,7 +179,7 @@ class Experiment:
             "adapter_learning_rate": 0.001,
             "weight_decay": 0.0001,
             "max_epochs": 20,
-            "minimum_epochs": 20,
+            "minimum_epochs": 1,
             "patience": 8,
             "gradient_clip_norm": 5.0,
             "batch_size": 256,
