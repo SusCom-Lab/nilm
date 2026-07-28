@@ -126,6 +126,20 @@ def _reject_existing(path: Path) -> None:
         )
 
 
+def is_trained_baseline_checkpoint_improvement(
+    epoch: int,
+    validation_loss: float,
+    best_loss: float | None,
+    min_delta: float,
+) -> bool:
+    """Exclude the untrained epoch 0 from M0 checkpoint selection."""
+    if epoch < 1:
+        return False
+    if best_loss is None:
+        return True
+    return validation_loss < best_loss - min_delta
+
+
 class Experiment:
     def __init__(self, config_path: Path, run_id: str | None, device_name: str | None):
         self.config_path = config_path.resolve()
@@ -319,21 +333,28 @@ class Experiment:
             model.parameters(), lr=float(self.config["training"]["learning_rate"])
         )
         epochs = int(self.config["training"]["baseline_epochs"])
+        if epochs < 1:
+            raise ValueError("M0 requires at least one trained epoch.")
         patience = int(self.config["training"]["patience"])
         min_delta = float(self.config["training"]["min_delta"])
-        best_loss = self._normalized_val_loss(model, val_loader, self.device)
-        best_epoch = 0
-        history = [{"epoch": 0, "validation_mse": best_loss}]
+        initial_val_loss = self._normalized_val_loss(model, val_loader, self.device)
+        best_loss = None
+        best_epoch = None
+        history = [
+            {
+                "epoch": 0,
+                "validation_mse": initial_val_loss,
+                "checkpoint_eligible": False,
+            }
+        ]
         checkpoint_base = {
             "mode": "M0",
             "model_key": "seq2point",
             "init_kwargs": model.get_init_kwargs(),
             "normalisation_stats": stats.to_dict(),
+            "checkpoint_selection_start_epoch": 1,
             "seed": self.seed,
         }
-        initial = {**checkpoint_base, "epoch": 0, "validation_mse": best_loss, "model_state": model.state_dict()}
-        initial["baseline_sha256"] = module_sha256(model)
-        _save_best(self.baseline_path, initial)
         stale = 0
         for epoch in range(1, epochs + 1):
             model.train()
@@ -351,10 +372,17 @@ class Experiment:
                 train_count += len(target)
             val_loss = self._normalized_val_loss(model, val_loader, self.device)
             history.append(
-                {"epoch": epoch, "train_mse": train_sum / max(1, train_count), "validation_mse": val_loss}
+                {
+                    "epoch": epoch,
+                    "train_mse": train_sum / max(1, train_count),
+                    "validation_mse": val_loss,
+                    "checkpoint_eligible": True,
+                }
             )
             print(f"M0 epoch {epoch:03d}: train={history[-1]['train_mse']:.6f} val={val_loss:.6f}")
-            if val_loss < best_loss - min_delta:
+            if is_trained_baseline_checkpoint_improvement(
+                epoch, val_loss, best_loss, min_delta
+            ):
                 best_loss, best_epoch, stale = val_loss, epoch, 0
                 checkpoint = {
                     **checkpoint_base,
@@ -368,6 +396,8 @@ class Experiment:
                 stale += 1
                 if stale >= patience:
                     break
+        if best_epoch is None or not self.baseline_path.exists():
+            raise RuntimeError("M0 completed without a trained checkpoint.")
         manifest = self._base_manifest(stats)
         manifest["checkpoints"]["M0"] = str(self.baseline_path.relative_to(REPO_ROOT))
         manifest["best_epochs"]["M0"] = best_epoch

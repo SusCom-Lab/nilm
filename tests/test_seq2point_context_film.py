@@ -6,6 +6,9 @@ import numpy as np
 import pandas as pd
 import torch
 
+from experiments.run_seq2point_context_film import (
+    is_trained_baseline_checkpoint_improvement,
+)
 from model_pipeline.context_data_feeder import (
     HouseholdBalancedBatchSampler,
     LeakageGuard,
@@ -51,6 +54,20 @@ class Seq2PointFiLMTest(unittest.TestCase):
             legacy = self.baseline.network(self.query.unsqueeze(1))
             wrapped = self.baseline(self.query)
         torch.testing.assert_close(wrapped, legacy, rtol=0, atol=0)
+
+    def test_m0_checkpoint_selection_excludes_untrained_epoch_zero(self):
+        self.assertFalse(
+            is_trained_baseline_checkpoint_improvement(0, 0.1, None, 1e-4)
+        )
+        self.assertTrue(
+            is_trained_baseline_checkpoint_improvement(1, 1.2, None, 1e-4)
+        )
+        self.assertTrue(
+            is_trained_baseline_checkpoint_improvement(2, 1.0, 1.2, 1e-4)
+        )
+        self.assertFalse(
+            is_trained_baseline_checkpoint_improvement(3, 1.19995, 1.2, 1e-4)
+        )
 
     def test_zero_init_global_and_context_film_match_baseline(self):
         global_adapter = GlobalFiLMSeq2Point(self.baseline).eval()
