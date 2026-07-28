@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 
-from experiments.run_seq2point_context_film import (
-    is_trained_baseline_checkpoint_improvement,
-)
+from experiments.run_seq2point_context_film import HouseholdContextTrainerModel
 from model_pipeline.context_data_feeder import (
     HouseholdBalancedBatchSampler,
     LeakageGuard,
@@ -25,6 +25,8 @@ from model_pipeline.models.context_adapter.seq2point_film import (
     module_sha256,
 )
 from model_pipeline.models.seq2point.seq2point import Seq2Point
+from model_pipeline.test_model import Evaluator
+from model_pipeline.train_model import Trainer
 
 
 def aggregate_frame(length: int = 100, *, with_labels: bool = False) -> pd.DataFrame:
@@ -55,19 +57,59 @@ class Seq2PointFiLMTest(unittest.TestCase):
             wrapped = self.baseline(self.query)
         torch.testing.assert_close(wrapped, legacy, rtol=0, atol=0)
 
-    def test_m0_checkpoint_selection_excludes_untrained_epoch_zero(self):
-        self.assertFalse(
-            is_trained_baseline_checkpoint_improvement(0, 0.1, None, 1e-4)
-        )
-        self.assertTrue(
-            is_trained_baseline_checkpoint_improvement(1, 1.2, None, 1e-4)
-        )
-        self.assertTrue(
-            is_trained_baseline_checkpoint_improvement(2, 1.0, 1.2, 1e-4)
-        )
-        self.assertFalse(
-            is_trained_baseline_checkpoint_improvement(3, 1.19995, 1.2, 1e-4)
-        )
+    def test_m0_trainer_does_not_checkpoint_untrained_epoch_zero(self):
+        class TinyModel(torch.nn.Module):
+            supports_gradient = True
+            display_name = "Tiny"
+
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(()))
+
+            def forward(self, inputs):
+                return inputs[:, :1] * self.weight
+
+            @staticmethod
+            def prepare_targets(targets):
+                return targets.reshape(-1)
+
+            @staticmethod
+            def prepare_outputs(outputs):
+                return outputs.reshape(-1)
+
+        inputs = torch.ones(4, 3)
+        targets = torch.ones(4)
+        loader = DataLoader(TensorDataset(inputs, targets), batch_size=4)
+        saved_epochs = []
+        model = TinyModel()
+        with TemporaryDirectory() as directory:
+            trainer = Trainer(
+                model=model,
+                train_loader=loader,
+                validation_loader=loader,
+                optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
+                model_save_dir=directory,
+                result_dir=directory,
+                device="cpu",
+                minimum_epochs=1,
+                select_epoch_zero=False,
+                checkpoint_callback=lambda value: saved_epochs.append(value.current_epoch)
+                or "memory",
+            )
+            trainer.trainModel(num_epochs=1)
+        self.assertEqual(saved_epochs, [1])
+        self.assertEqual(trainer.best_epoch, 1)
+
+    def test_early_stopping_cannot_trigger_before_twenty_epochs(self):
+        trainer = object.__new__(Trainer)
+        trainer.minimum_epochs = 20
+        trainer.patience = 8
+        trainer.counter = 20
+        self.assertFalse(trainer._should_early_stop(8))
+        self.assertFalse(trainer._should_early_stop(19))
+        self.assertTrue(trainer._should_early_stop(20))
+        trainer.counter = 7
+        self.assertFalse(trainer._should_early_stop(20))
 
     def test_zero_init_global_and_context_film_match_baseline(self):
         global_adapter = GlobalFiLMSeq2Point(self.baseline).eval()
@@ -99,6 +141,55 @@ class Seq2PointFiLMTest(unittest.TestCase):
         optimizer.step()
         self.assertEqual(before, module_sha256(adapter.baseline))
         self.assertFalse(any(parameter.requires_grad for parameter in adapter.baseline.parameters()))
+
+    def test_context_household_batch_runs_through_trainer_hook(self):
+        adapter = HouseholdContextTrainerModel(
+            self.baseline,
+            window_size=self.window_size,
+            code_dim=8,
+            generator_hidden_dim=12,
+        )
+        contexts = {
+            house: (
+                torch.randn(4, self.window_size),
+                torch.ones(4, dtype=torch.bool),
+            )
+            for house in ("H1", "H2", "H5")
+        }
+        adapter.configure_training_contexts(
+            contexts, ["H1", "H2"], "H5", torch.device("cpu")
+        )
+        batch = (
+            self.query,
+            torch.randn(len(self.query)),
+            torch.tensor([0, 1, 0]),
+        )
+        inputs, targets = adapter.prepare_batch(batch, device="cpu")
+        loss = adapter.compute_loss(inputs, targets, criterion=torch.nn.MSELoss())
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertFalse(any(parameter.grad is not None for parameter in adapter.baseline.parameters()))
+
+    def test_evaluator_supports_aggregate_only_prediction_then_delayed_scoring(self):
+        loader = DataLoader(TensorDataset(self.query), batch_size=2)
+        prediction = Evaluator.predict_aggregate_loader(
+            loader,
+            lambda inputs: torch.ones(len(inputs), 1),
+            device="cpu",
+        )
+        self.assertEqual(len(prediction), len(self.query))
+        timestamps = pd.date_range("2020-01-01", periods=len(prediction), freq="6s")
+        metrics = Evaluator.score_aligned_predictions(
+            prediction,
+            np.zeros_like(prediction),
+            np.full_like(prediction, 100.0),
+            np.zeros_like(prediction, dtype=np.int8),
+            timestamps,
+            appliance_name="washing_machine",
+        )
+        self.assertIn("MAE", metrics)
+        self.assertIn("F1", metrics)
+        self.assertIn("pred_total_energy_Wh", metrics)
 
     def test_uniform_selector_accepts_aggregate_only_and_rejects_labels(self):
         stats = NormalisationStats(200.0, 50.0, 0.0, 1.0)

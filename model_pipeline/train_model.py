@@ -175,6 +175,11 @@ class Trainer:
         appliance_on_threshold=None,
         min_on_points=1,
         min_on_rate=None,
+        patience=8,
+        min_delta=1e-4,
+        minimum_epochs=1,
+        select_epoch_zero=False,
+        checkpoint_callback=None,
     ):
         set_random_seed(seed)
         model_init_kwargs = dict(model_init_kwargs or {})
@@ -252,18 +257,43 @@ class Trainer:
             self.optimizer = optimizer
             self.scheduler = None
 
-        self.patience = 8
+        self.patience = int(patience)
+        self.minimum_epochs = int(minimum_epochs)
+        if self.minimum_epochs < 1:
+            raise ValueError("minimum_epochs must be at least 1.")
+        self.select_epoch_zero = bool(select_epoch_zero)
+        self.checkpoint_callback = checkpoint_callback
         self.best_val_loss = float("inf")
-        self.min_delta = 1e-4
+        self.best_epoch = None
+        self.current_epoch = None
+        self.current_selection_loss = None
+        self.min_delta = float(min_delta)
         self.counter = 0
         self.train_losses = []
         self.val_losses = []
         self.selection_losses = []
+        self.epoch_history = []
 
     def _prepare_torch_batch(self, inputs, targets):
         inputs = inputs.to(self.device)
         targets = self.model.prepare_targets(targets.to(self.device))
         return inputs, targets
+
+    def _prepare_loader_batch(self, batch):
+        hook = getattr(self.model, "prepare_batch", None)
+        if callable(hook):
+            return hook(batch, device=self.device)
+        if not isinstance(batch, (tuple, list)) or len(batch) != 2:
+            raise ValueError(
+                "Trainer batches must be (inputs, targets), unless model.prepare_batch is provided."
+            )
+        return self._prepare_torch_batch(batch[0], batch[1])
+
+    def _should_early_stop(self, completed_epochs):
+        return (
+            int(completed_epochs) >= self.minimum_epochs
+            and self.counter >= self.patience
+        )
 
     def _model_loss_hook(self):
         hook = getattr(self.model, "compute_loss", None)
@@ -299,6 +329,8 @@ class Trainer:
         return np.concatenate(all_inputs, axis=0), np.concatenate(all_targets, axis=0)
 
     def _save_checkpoint(self):
+        if self.checkpoint_callback is not None:
+            return self.checkpoint_callback(self)
         appliance_name = self.appliance_name_formatted
         if getattr(self.model, "is_joint_model", lambda: False)():
             appliance_name = "multi_appliance"
@@ -327,6 +359,27 @@ class Trainer:
         path = os.path.join(self.model_save_dir, f"{self.appliance}_{self.dataset}_{self.model_name}.pth")
         torch.save(checkpoint, path)
         return path
+
+    def _validate_torch(self):
+        if self.validation_loader is None:
+            return None, None
+        self.model.eval()
+        val_loss = 0.0
+        selection_loss = 0.0
+        with torch.no_grad():
+            for batch in self.validation_loader:
+                inputs, targets = self._prepare_loader_batch(batch)
+                loss, _ = self._torch_loss(inputs, targets)
+                val_loss += loss.item()
+                selection_hook = getattr(self.model, "compute_selection_loss", None)
+                if callable(selection_hook):
+                    selected = selection_hook(inputs, targets, criterion=self.criterion)
+                else:
+                    selected = loss
+                selection_loss += selected.item()
+        val_loss /= max(1, len(self.validation_loader))
+        selection_loss /= max(1, len(self.validation_loader))
+        return val_loss, selection_loss
 
     def trainModel(self, num_epochs=10):
         if self.train_loader is None:
@@ -372,11 +425,39 @@ class Trainer:
             print(f"Classical model fitted. Checkpoint saved to {checkpoint_path}")
             return
 
+        if num_epochs < self.minimum_epochs:
+            raise ValueError(
+                f"num_epochs ({num_epochs}) must be >= minimum_epochs ({self.minimum_epochs})."
+            )
+
+        if self.select_epoch_zero and self.validation_loader is not None:
+            val_loss, selection_loss = self._validate_torch()
+            self.current_epoch = 0
+            self.current_selection_loss = selection_loss
+            self.best_val_loss = selection_loss
+            self.best_epoch = 0
+            self.val_losses.append(val_loss)
+            self.selection_losses.append(selection_loss)
+            self.epoch_history.append(
+                {
+                    "epoch": 0,
+                    "validation_mse": val_loss,
+                    "selection_loss": selection_loss,
+                    "checkpoint_eligible": True,
+                }
+            )
+            checkpoint_path = self._save_checkpoint()
+            print(f"Epoch 0 identity checkpoint saved to {checkpoint_path}")
+
         for epoch in range(num_epochs):
+            batch_sampler = getattr(self.train_loader, "batch_sampler", None)
+            set_epoch = getattr(batch_sampler, "set_epoch", None)
+            if callable(set_epoch):
+                set_epoch(epoch + 1)
             self.model.train()
             train_loss = 0.0
-            for inputs, targets in self.train_loader:
-                inputs, targets = self._prepare_torch_batch(inputs, targets)
+            for batch in self.train_loader:
+                inputs, targets = self._prepare_loader_batch(batch)
                 self.optimizer.zero_grad()
                 loss, _ = self._torch_loss(inputs, targets)
                 loss.backward()
@@ -388,17 +469,7 @@ class Trainer:
             val_loss = train_loss
             selection_loss = val_loss
             if self.validation_loader is not None:
-                self.model.eval()
-                val_loss = 0.0
-                selection_loss = 0.0
-                with torch.no_grad():
-                    for inputs, targets in self.validation_loader:
-                        inputs, targets = self._prepare_torch_batch(inputs, targets)
-                        loss, _ = self._torch_loss(inputs, targets)
-                        val_loss += loss.item()
-                        selection_loss += self._torch_selection_loss(inputs, targets).item()
-                val_loss /= max(1, len(self.validation_loader))
-                selection_loss /= max(1, len(self.validation_loader))
+                val_loss, selection_loss = self._validate_torch()
 
             print(
                 f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss}, "
@@ -408,16 +479,28 @@ class Trainer:
             self.train_losses.append(train_loss)
             self.val_losses.append(val_loss)
             self.selection_losses.append(selection_loss)
+            self.current_epoch = epoch + 1
+            self.current_selection_loss = selection_loss
+            self.epoch_history.append(
+                {
+                    "epoch": epoch + 1,
+                    "train_mse": train_loss,
+                    "validation_mse": val_loss,
+                    "selection_loss": selection_loss,
+                    "checkpoint_eligible": True,
+                }
+            )
             self.scheduler.step(selection_loss)
 
             if selection_loss < self.best_val_loss - self.min_delta:
                 self.best_val_loss = selection_loss
+                self.best_epoch = epoch + 1
                 checkpoint_path = self._save_checkpoint()
                 print(f"Validation improved. Checkpoint saved to {checkpoint_path}")
                 self.counter = 0
             else:
                 self.counter += 1
-                if self.counter >= self.patience:
+                if self._should_early_stop(epoch + 1):
                     print(f"Early stopping triggered after {epoch + 1} epochs.")
                     break
 

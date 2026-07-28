@@ -34,6 +34,7 @@
     "baseline_epochs": 30,
     "global_film_epochs": 20,
     "context_film_epochs": 20,
+    "minimum_epochs": 20,
     "batch_size": 256,
     "learning_rate": 0.001,
     "adapter_learning_rate": 0.001,

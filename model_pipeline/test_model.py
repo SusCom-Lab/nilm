@@ -273,6 +273,77 @@ class Evaluator:
         self.joint_metrics = pd.DataFrame()
         self._joint_grouped_data = None
 
+    @staticmethod
+    def predict_aggregate_loader(loader, forward_fn, *, device):
+        """Run aggregate-only inference without requiring or touching labels."""
+        prediction_windows = []
+        with torch.no_grad():
+            for batch in loader:
+                inputs = batch[0] if isinstance(batch, (tuple, list)) else batch
+                outputs = forward_fn(inputs.to(device))
+                prediction_windows.append(outputs.reshape(-1).detach().cpu().numpy())
+        if not prediction_windows:
+            raise ValueError("Prediction loader produced no windows.")
+        return np.concatenate(prediction_windows).astype(np.float32)
+
+    @staticmethod
+    def score_aligned_predictions(
+        prediction,
+        ground_truth,
+        aggregate,
+        true_status,
+        timestamps,
+        *,
+        appliance_name,
+        gamma=None,
+        beta=None,
+    ):
+        """Score predictions after labels have been explicitly unsealed and aligned."""
+        prediction = np.asarray(prediction, dtype=np.float32)
+        ground_truth = np.clip(np.asarray(ground_truth, dtype=np.float32), 0.0, None)
+        aggregate = np.clip(np.asarray(aggregate, dtype=np.float32), 0.0, None)
+        prediction = np.minimum(np.clip(prediction, 0.0, None), aggregate)
+        true_status = np.asarray(true_status, dtype=np.int8)
+        base_metrics = compute_metrics(prediction, ground_truth)
+        status_metrics, _, _, _ = _compute_status_metrics(
+            prediction,
+            ground_truth,
+            timestamps,
+            appliance_name,
+            true_status,
+        )
+        time_values = pd.to_datetime(pd.Series(timestamps))
+        diffs = time_values.diff().dt.total_seconds().dropna()
+        positive_diffs = diffs[diffs > 0]
+        sample_period = float(positive_diffs.median()) if not positive_diffs.empty else 1.0
+        on_mask = true_status.astype(bool)
+
+        def tensor_norm(value):
+            if value is None:
+                return 0.0
+            return float(torch.linalg.vector_norm(value).item())
+
+        return {
+            "MAE": base_metrics["MAE"],
+            "MAE-on": status_metrics["MAE_on"],
+            "MAE-off": status_metrics["MAE_off"],
+            "SAE": base_metrics["SAE"],
+            "Precision": status_metrics["Precision"],
+            "Recall": status_metrics["Recall"],
+            "F1": status_metrics["F1-score"],
+            "FPR": status_metrics["FPR"],
+            "true_total_energy_Wh": float(np.sum(ground_truth) * sample_period / 3600.0),
+            "pred_total_energy_Wh": float(np.sum(prediction) * sample_period / 3600.0),
+            "true_ON_mean_power_W": (
+                float(np.mean(ground_truth[on_mask])) if bool(on_mask.any()) else np.nan
+            ),
+            "pred_ON_mean_power_W": (
+                float(np.mean(prediction[on_mask])) if bool(on_mask.any()) else np.nan
+            ),
+            "gamma_norm": tensor_norm(gamma),
+            "beta_norm": tensor_norm(beta),
+        }
+
     def _run_batch(self, inputs, targets):
         if getattr(self.model, "supports_gradient", False):
             inputs = inputs.to(self.device)

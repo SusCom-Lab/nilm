@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/nilm-matplotlib")
 
@@ -44,8 +44,8 @@ from model_pipeline.models.context_adapter.seq2point_film import (  # noqa: E402
     module_sha256,
 )
 from model_pipeline.models.seq2point.seq2point import Seq2Point  # noqa: E402
-from model_pipeline.test_model import _compute_status_metrics  # noqa: E402
-from model_pipeline.train_model import compute_metrics  # noqa: E402
+from model_pipeline.test_model import Evaluator  # noqa: E402
+from model_pipeline.train_model import Trainer  # noqa: E402
 
 
 def load_config(path: Path) -> dict:
@@ -126,18 +126,55 @@ def _reject_existing(path: Path) -> None:
         )
 
 
-def is_trained_baseline_checkpoint_improvement(
-    epoch: int,
-    validation_loss: float,
-    best_loss: float | None,
-    min_delta: float,
-) -> bool:
-    """Exclude the untrained epoch 0 from M0 checkpoint selection."""
-    if epoch < 1:
-        return False
-    if best_loss is None:
-        return True
-    return validation_loss < best_loss - min_delta
+class HouseholdContextTrainerModel(ContextFiLMSeq2Point):
+    """Trainer hook that pairs balanced household queries with cached A contexts."""
+
+    def configure_training_contexts(
+        self,
+        contexts: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        train_houses: list[str],
+        validation_house: str,
+        device: torch.device,
+    ) -> None:
+        self._training_contexts = [
+            tuple(value.to(device) for value in contexts[house]) for house in train_houses
+        ]
+        self._validation_context = tuple(
+            value.to(device) for value in contexts[validation_house]
+        )
+
+    def prepare_batch(self, batch, *, device):
+        if not isinstance(batch, (tuple, list)) or len(batch) not in (2, 3):
+            raise ValueError("Context-FiLM batches must contain query, target, and optional house id.")
+        query = batch[0].to(device)
+        target = self.prepare_targets(batch[1].to(device))
+        house_indices = None if len(batch) == 2 else batch[2].to(device)
+        return {"query": query, "house_indices": house_indices}, target
+
+    def compute_loss(self, inputs, targets, *, criterion):
+        query = inputs["query"]
+        house_indices = inputs["house_indices"]
+        if house_indices is None:
+            windows, mask = self._validation_context
+            _, gamma, beta = self.generate_film(
+                windows.unsqueeze(0), mask.unsqueeze(0)
+            )
+            prediction = self.forward_with_film(query, gamma, beta).reshape(-1)
+            return criterion(prediction, targets)
+
+        loss_sum = torch.zeros((), device=query.device)
+        for house_index, (windows, mask) in enumerate(self._training_contexts):
+            selected = house_indices == house_index
+            if not bool(selected.any()):
+                continue
+            _, gamma, beta = self.generate_film(
+                windows.unsqueeze(0), mask.unsqueeze(0)
+            )
+            prediction = self.forward_with_film(query[selected], gamma, beta).reshape(-1)
+            loss_sum = loss_sum + nn.functional.mse_loss(
+                prediction, targets[selected], reduction="sum"
+            )
+        return loss_sum / len(targets)
 
 
 class Experiment:
@@ -156,6 +193,10 @@ class Experiment:
         self.specs = resolve_block_specs(self.config, REPO_ROOT)
         self.guard = LeakageGuard(test_house=self.config["house_split"]["test"][0])
         self.chunksize = int(self.config["data"].get("chunksize", 250_000))
+        minimum_epochs = int(self.config["training"]["minimum_epochs"])
+        for key in ("baseline_epochs", "global_film_epochs", "context_film_epochs"):
+            if int(self.config["training"][key]) < minimum_epochs:
+                raise ValueError(f"{key} must be >= minimum_epochs ({minimum_epochs}).")
 
     @property
     def baseline_path(self) -> Path:
@@ -216,6 +257,14 @@ class Experiment:
             },
             "seed": self.seed,
             "git": _git_state(),
+            "engines": {
+                "training": "model_pipeline.train_model.Trainer",
+                "evaluation": "model_pipeline.test_model.Evaluator",
+                "context_batch_hook": (
+                    "experiments.run_seq2point_context_film."
+                    "HouseholdContextTrainerModel"
+                ),
+            },
             "access_audit": [],
             "checkpoints": {},
             "best_epochs": {},
@@ -281,20 +330,6 @@ class Experiment:
             num_workers=int(self.config["training"].get("num_workers", 0)),
         )
 
-    @staticmethod
-    def _normalized_val_loss(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
-        model.eval()
-        total = 0.0
-        count = 0
-        with torch.no_grad():
-            for query, target in loader:
-                query = query.to(device)
-                target = target.to(device)
-                prediction = model(query).reshape(-1)
-                total += nn.functional.mse_loss(prediction, target, reduction="sum").item()
-                count += len(target)
-        return total / max(1, count)
-
     def train_baseline(self) -> None:
         _reject_existing(self.baseline_path)
         if self.manifest_path.exists():
@@ -321,7 +356,7 @@ class Experiment:
             ["aggregate", self.config["appliance"]],
             "checkpoint_selection",
         )
-        train_dataset = MultiHouseQueryDataset(
+        train_dataset = ConcatDataset(
             [self._query_dataset(train_b[house], house, stats) for house in train_houses]
         )
         val_dataset = self._query_dataset(val_b, val_house, stats)
@@ -332,79 +367,49 @@ class Experiment:
         optimizer = torch.optim.Adam(
             model.parameters(), lr=float(self.config["training"]["learning_rate"])
         )
-        epochs = int(self.config["training"]["baseline_epochs"])
-        if epochs < 1:
-            raise ValueError("M0 requires at least one trained epoch.")
-        patience = int(self.config["training"]["patience"])
-        min_delta = float(self.config["training"]["min_delta"])
-        initial_val_loss = self._normalized_val_loss(model, val_loader, self.device)
-        best_loss = None
-        best_epoch = None
-        history = [
-            {
-                "epoch": 0,
-                "validation_mse": initial_val_loss,
-                "checkpoint_eligible": False,
+        def save_baseline(trainer):
+            checkpoint = {
+                "mode": "M0",
+                "model_key": "seq2point",
+                "init_kwargs": trainer.model.get_init_kwargs(),
+                "normalisation_stats": stats.to_dict(),
+                "checkpoint_selection_start_epoch": 1,
+                "epoch": trainer.current_epoch,
+                "validation_mse": trainer.current_selection_loss,
+                "model_state": trainer.model.state_dict(),
+                "seed": self.seed,
             }
-        ]
-        checkpoint_base = {
-            "mode": "M0",
-            "model_key": "seq2point",
-            "init_kwargs": model.get_init_kwargs(),
-            "normalisation_stats": stats.to_dict(),
-            "checkpoint_selection_start_epoch": 1,
-            "seed": self.seed,
-        }
-        stale = 0
-        for epoch in range(1, epochs + 1):
-            model.train()
-            train_sum = 0.0
-            train_count = 0
-            for query, target, _ in train_loader:
-                query = query.to(self.device)
-                target = target.to(self.device)
-                optimizer.zero_grad(set_to_none=True)
-                prediction = model(query).reshape(-1)
-                loss = nn.functional.mse_loss(prediction, target)
-                loss.backward()
-                optimizer.step()
-                train_sum += loss.item() * len(target)
-                train_count += len(target)
-            val_loss = self._normalized_val_loss(model, val_loader, self.device)
-            history.append(
-                {
-                    "epoch": epoch,
-                    "train_mse": train_sum / max(1, train_count),
-                    "validation_mse": val_loss,
-                    "checkpoint_eligible": True,
-                }
-            )
-            print(f"M0 epoch {epoch:03d}: train={history[-1]['train_mse']:.6f} val={val_loss:.6f}")
-            if is_trained_baseline_checkpoint_improvement(
-                epoch, val_loss, best_loss, min_delta
-            ):
-                best_loss, best_epoch, stale = val_loss, epoch, 0
-                checkpoint = {
-                    **checkpoint_base,
-                    "epoch": epoch,
-                    "validation_mse": val_loss,
-                    "model_state": model.state_dict(),
-                }
-                checkpoint["baseline_sha256"] = module_sha256(model)
-                _save_best(self.baseline_path, checkpoint)
-            else:
-                stale += 1
-                if stale >= patience:
-                    break
-        if best_epoch is None or not self.baseline_path.exists():
-            raise RuntimeError("M0 completed without a trained checkpoint.")
+            checkpoint["baseline_sha256"] = module_sha256(trainer.model)
+            _save_best(self.baseline_path, checkpoint)
+            return self.baseline_path
+
+        trainer = Trainer(
+            model=model,
+            train_loader=train_loader,
+            validation_loader=val_loader,
+            optimizer=optimizer,
+            criterion=nn.MSELoss(),
+            appliance=self.config["appliance"],
+            dataset=self.config["dataset"],
+            model_save_dir=str(self.checkpoint_dir),
+            result_dir=str(self.run_dir),
+            seed=self.seed,
+            device=str(self.device),
+            normalisation_stats=stats.to_dict(),
+            patience=int(self.config["training"]["patience"]),
+            min_delta=float(self.config["training"]["min_delta"]),
+            minimum_epochs=int(self.config["training"]["minimum_epochs"]),
+            select_epoch_zero=False,
+            checkpoint_callback=save_baseline,
+        )
+        trainer.trainModel(num_epochs=int(self.config["training"]["baseline_epochs"]))
         manifest = self._base_manifest(stats)
         manifest["checkpoints"]["M0"] = str(self.baseline_path.relative_to(REPO_ROOT))
-        manifest["best_epochs"]["M0"] = best_epoch
-        manifest["training_history"] = {"M0": history}
+        manifest["best_epochs"]["M0"] = trainer.best_epoch
+        manifest["training_history"] = {"M0": trainer.epoch_history}
         manifest["h6_evaluation_timestamp_policy"] = "H6-B valid Seq2Point center timestamps"
         self._update_manifest(manifest)
-        print(f"M0 best epoch: {best_epoch}; checkpoint: {self.baseline_path}")
+        print(f"M0 best epoch: {trainer.best_epoch}; checkpoint: {self.baseline_path}")
 
     def _adapter_frames(self, include_context: bool):
         manifest = self._load_manifest()
@@ -449,7 +454,7 @@ class Experiment:
         adapter = GlobalFiLMSeq2Point(baseline).to(self.device)
         adapter.assert_baseline_frozen()
         baseline_hash = module_sha256(adapter.baseline)
-        train_dataset = MultiHouseQueryDataset(
+        train_dataset = ConcatDataset(
             [self._query_dataset(train_b[house], house, stats) for house in houses]
         )
         val_dataset = self._query_dataset(val_b, val_house, stats)
@@ -461,46 +466,44 @@ class Experiment:
             [parameter for parameter in adapter.parameters() if parameter.requires_grad],
             lr=float(self.config["training"]["adapter_learning_rate"]),
         )
-        best_loss = self._normalized_val_loss(adapter, val_loader, self.device)
-        best_epoch = 0
-        history = [{"epoch": 0, "validation_mse": best_loss, "identity_max_abs_error": identity_error}]
-        _save_best(
-            self.global_path,
-            self._global_checkpoint(adapter, baseline_checkpoint, 0, best_loss, identity_error),
+        def save_global(trainer):
+            checkpoint = self._global_checkpoint(
+                trainer.model,
+                baseline_checkpoint,
+                trainer.current_epoch,
+                trainer.current_selection_loss,
+                identity_error,
+            )
+            _save_best(self.global_path, checkpoint)
+            return self.global_path
+
+        trainer = Trainer(
+            model=adapter,
+            train_loader=train_loader,
+            validation_loader=val_loader,
+            optimizer=optimizer,
+            criterion=nn.MSELoss(),
+            appliance=self.config["appliance"],
+            dataset=self.config["dataset"],
+            model_save_dir=str(self.checkpoint_dir),
+            result_dir=str(self.run_dir),
+            seed=self.seed,
+            device=str(self.device),
+            normalisation_stats=stats.to_dict(),
+            patience=int(self.config["training"]["patience"]),
+            min_delta=float(self.config["training"]["min_delta"]),
+            minimum_epochs=int(self.config["training"]["minimum_epochs"]),
+            select_epoch_zero=True,
+            checkpoint_callback=save_global,
         )
-        stale = 0
-        for epoch in range(1, int(self.config["training"]["global_film_epochs"]) + 1):
-            adapter.train()
-            train_sum = 0.0
-            train_count = 0
-            for query, target, _ in train_loader:
-                query, target = query.to(self.device), target.to(self.device)
-                optimizer.zero_grad(set_to_none=True)
-                loss = nn.functional.mse_loss(adapter(query).reshape(-1), target)
-                loss.backward()
-                optimizer.step()
-                train_sum += loss.item() * len(target)
-                train_count += len(target)
-            val_loss = self._normalized_val_loss(adapter, val_loader, self.device)
-            history.append({"epoch": epoch, "train_mse": train_sum / train_count, "validation_mse": val_loss})
-            print(f"M1 epoch {epoch:03d}: train={history[-1]['train_mse']:.6f} val={val_loss:.6f}")
-            if val_loss < best_loss - float(self.config["training"]["min_delta"]):
-                best_loss, best_epoch, stale = val_loss, epoch, 0
-                _save_best(
-                    self.global_path,
-                    self._global_checkpoint(adapter, baseline_checkpoint, epoch, val_loss, identity_error),
-                )
-            else:
-                stale += 1
-                if stale >= int(self.config["training"]["patience"]):
-                    break
+        trainer.trainModel(num_epochs=int(self.config["training"]["global_film_epochs"]))
         if module_sha256(adapter.baseline) != baseline_hash:
             raise RuntimeError("Frozen M0 weights changed during Global-FiLM training.")
         manifest["checkpoints"]["M1"] = str(self.global_path.relative_to(REPO_ROOT))
-        manifest["best_epochs"]["M1"] = best_epoch
-        manifest.setdefault("training_history", {})["M1"] = history
+        manifest["best_epochs"]["M1"] = trainer.best_epoch
+        manifest.setdefault("training_history", {})["M1"] = trainer.epoch_history
         self._update_manifest(manifest)
-        print(f"M1 best epoch: {best_epoch}; checkpoint: {self.global_path}")
+        print(f"M1 best epoch: {trainer.best_epoch}; checkpoint: {self.global_path}")
 
     def _global_checkpoint(self, adapter, baseline_checkpoint, epoch, val_loss, identity_error):
         return {
@@ -531,35 +534,30 @@ class Experiment:
             selections[house] = [str(value) for value in timestamps]
         return tensors, selections
 
-    def _new_context_adapter(self, baseline: Seq2Point) -> ContextFiLMSeq2Point:
-        return ContextFiLMSeq2Point(
+    def _new_context_adapter(
+        self, baseline: Seq2Point, *, for_training: bool = False
+    ) -> ContextFiLMSeq2Point:
+        adapter_class = (
+            HouseholdContextTrainerModel if for_training else ContextFiLMSeq2Point
+        )
+        return adapter_class(
             baseline,
             window_size=int(self.config["window_size"]),
             code_dim=int(self.config["context_code_dim"]),
             generator_hidden_dim=int(self.config["generator_hidden_dim"]),
         )
 
-    def _context_val_loss(self, adapter, loader, context_pair) -> float:
-        adapter.eval()
-        windows, mask = (value.to(self.device) for value in context_pair)
-        total, count = 0.0, 0
-        with torch.no_grad():
-            _, gamma, beta = adapter.generate_film(windows.unsqueeze(0), mask.unsqueeze(0))
-            for query, target in loader:
-                query, target = query.to(self.device), target.to(self.device)
-                prediction = adapter.forward_with_film(query, gamma, beta).reshape(-1)
-                total += nn.functional.mse_loss(prediction, target, reduction="sum").item()
-                count += len(target)
-        return total / max(1, count)
-
     def train_context_film(self) -> None:
         _reject_existing(self.context_path)
         manifest, stats, houses, train_b, val_house, val_b, context_frames = self._adapter_frames(True)
         baseline, baseline_checkpoint = self._load_baseline()
-        adapter = self._new_context_adapter(baseline).to(self.device)
+        adapter = self._new_context_adapter(baseline, for_training=True).to(self.device)
         adapter.assert_baseline_frozen()
         baseline_hash = module_sha256(adapter.baseline)
         contexts, selections = self._context_tensors(context_frames, stats)
+        adapter.configure_training_contexts(
+            contexts, houses, val_house, self.device
+        )
         train_dataset = MultiHouseQueryDataset(
             [self._query_dataset(train_b[house], house, stats) for house in houses]
         )
@@ -587,59 +585,50 @@ class Experiment:
             [parameter for parameter in adapter.parameters() if parameter.requires_grad],
             lr=float(self.config["training"]["adapter_learning_rate"]),
         )
-        best_loss = self._context_val_loss(adapter, val_loader, contexts[val_house])
-        best_epoch = 0
-        history = [{"epoch": 0, "validation_mse": best_loss, "identity_max_abs_error": identity_error}]
-        _save_best(
-            self.context_path,
-            self._context_checkpoint(adapter, baseline_checkpoint, 0, best_loss, identity_error),
+        def save_context(trainer):
+            checkpoint = self._context_checkpoint(
+                trainer.model,
+                baseline_checkpoint,
+                trainer.current_epoch,
+                trainer.current_selection_loss,
+                identity_error,
+            )
+            _save_best(self.context_path, checkpoint)
+            return self.context_path
+
+        trainer = Trainer(
+            model=adapter,
+            train_loader=train_loader,
+            validation_loader=val_loader,
+            optimizer=optimizer,
+            criterion=nn.MSELoss(),
+            appliance=self.config["appliance"],
+            dataset=self.config["dataset"],
+            model_save_dir=str(self.checkpoint_dir),
+            result_dir=str(self.run_dir),
+            seed=self.seed,
+            device=str(self.device),
+            normalisation_stats=stats.to_dict(),
+            patience=int(self.config["training"]["patience"]),
+            min_delta=float(self.config["training"]["min_delta"]),
+            minimum_epochs=int(self.config["training"]["minimum_epochs"]),
+            select_epoch_zero=True,
+            checkpoint_callback=save_context,
         )
-        stale = 0
-        for epoch in range(1, int(self.config["training"]["context_film_epochs"]) + 1):
-            sampler.set_epoch(epoch)
-            adapter.train()
-            train_sum, train_count = 0.0, 0
-            for query, target, house_indices in train_loader:
-                query, target = query.to(self.device), target.to(self.device)
-                house_indices = house_indices.to(self.device)
-                optimizer.zero_grad(set_to_none=True)
-                loss_sum = torch.zeros((), device=self.device)
-                for house_index, house in enumerate(houses):
-                    selected = house_indices == house_index
-                    windows, mask = (value.to(self.device) for value in contexts[house])
-                    _, gamma, beta = adapter.generate_film(windows.unsqueeze(0), mask.unsqueeze(0))
-                    prediction = adapter.forward_with_film(query[selected], gamma, beta).reshape(-1)
-                    loss_sum = loss_sum + nn.functional.mse_loss(
-                        prediction, target[selected], reduction="sum"
-                    )
-                loss = loss_sum / len(target)
-                loss.backward()
-                optimizer.step()
-                train_sum += loss_sum.item()
-                train_count += len(target)
-            val_loss = self._context_val_loss(adapter, val_loader, contexts[val_house])
-            history.append({"epoch": epoch, "train_mse": train_sum / train_count, "validation_mse": val_loss})
-            print(f"M2 epoch {epoch:03d}: train={history[-1]['train_mse']:.6f} val={val_loss:.6f}")
-            if val_loss < best_loss - float(self.config["training"]["min_delta"]):
-                best_loss, best_epoch, stale = val_loss, epoch, 0
-                _save_best(
-                    self.context_path,
-                    self._context_checkpoint(adapter, baseline_checkpoint, epoch, val_loss, identity_error),
-                )
-            else:
-                stale += 1
-                if stale >= int(self.config["training"]["patience"]):
-                    break
+        trainer.trainModel(num_epochs=int(self.config["training"]["context_film_epochs"]))
         if module_sha256(adapter.baseline) != baseline_hash:
             raise RuntimeError("Frozen M0 weights changed during Context-FiLM training.")
         manifest["checkpoints"]["M2"] = str(self.context_path.relative_to(REPO_ROOT))
         manifest["checkpoints"]["M3"] = str(self.context_path.relative_to(REPO_ROOT))
-        manifest["best_epochs"]["M2"] = best_epoch
-        manifest["best_epochs"]["M3"] = best_epoch
+        manifest["best_epochs"]["M2"] = trainer.best_epoch
+        manifest["best_epochs"]["M3"] = trainer.best_epoch
         manifest["context_window_timestamps"] = selections
-        manifest.setdefault("training_history", {})["M2"] = history
+        manifest.setdefault("training_history", {})["M2"] = trainer.epoch_history
         self._update_manifest(manifest)
-        print(f"M2 best epoch: {best_epoch}; shared M2/M3 checkpoint: {self.context_path}")
+        print(
+            f"M2 best epoch: {trainer.best_epoch}; "
+            f"shared M2/M3 checkpoint: {self.context_path}"
+        )
 
     def _context_checkpoint(self, adapter, baseline_checkpoint, epoch, val_loss, identity_error):
         return {
@@ -680,11 +669,9 @@ class Experiment:
             shuffle=False,
             batch_size=int(self.config["evaluation"]["batch_size"]),
         )
-        values = []
-        with torch.no_grad():
-            for query in loader:
-                values.append(function(query.to(self.device)).reshape(-1).cpu().numpy())
-        return np.concatenate(values).astype(np.float32)
+        return Evaluator.predict_aggregate_loader(
+            loader, function, device=self.device
+        )
 
     @staticmethod
     def _distance(left: torch.Tensor, right: torch.Tensor) -> dict[str, float]:
@@ -708,32 +695,17 @@ class Experiment:
         gamma: torch.Tensor | None,
         beta: torch.Tensor | None,
     ) -> dict[str, object]:
-        prediction = np.minimum(np.clip(prediction, 0.0, None), np.clip(aggregate, 0.0, None))
-        truth = np.clip(truth, 0.0, None)
-        base = compute_metrics(prediction, truth)
-        status_metrics, _, _, _ = _compute_status_metrics(
-            prediction, truth, timestamps, self.config["appliance"], status
+        metrics = Evaluator.score_aligned_predictions(
+            prediction,
+            truth,
+            aggregate,
+            status,
+            timestamps,
+            appliance_name=self.config["appliance"],
+            gamma=gamma,
+            beta=beta,
         )
-        diffs = pd.to_datetime(timestamps).diff().dt.total_seconds().dropna()
-        sample_period = float(diffs[diffs > 0].median()) if bool((diffs > 0).any()) else 6.0
-        on = status.astype(bool)
-        return {
-            "method": name,
-            "MAE": base["MAE"],
-            "MAE-on": status_metrics["MAE_on"],
-            "MAE-off": status_metrics["MAE_off"],
-            "SAE": base["SAE"],
-            "Precision": status_metrics["Precision"],
-            "Recall": status_metrics["Recall"],
-            "F1": status_metrics["F1-score"],
-            "FPR": status_metrics["FPR"],
-            "true_total_energy_Wh": float(np.sum(truth) * sample_period / 3600.0),
-            "pred_total_energy_Wh": float(np.sum(prediction) * sample_period / 3600.0),
-            "true_ON_mean_power_W": float(np.mean(truth[on])) if bool(on.any()) else np.nan,
-            "pred_ON_mean_power_W": float(np.mean(prediction[on])) if bool(on.any()) else np.nan,
-            "gamma_norm": 0.0 if gamma is None else float(torch.linalg.vector_norm(gamma).item()),
-            "beta_norm": 0.0 if beta is None else float(torch.linalg.vector_norm(beta).item()),
-        }
+        return {"method": name, **metrics}
 
     def evaluate_all(self) -> None:
         _reject_existing(self.run_dir / "results.csv")

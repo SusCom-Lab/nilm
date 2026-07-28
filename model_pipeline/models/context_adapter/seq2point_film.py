@@ -34,6 +34,8 @@ def _bounded(raw: torch.Tensor) -> torch.Tensor:
 
 
 class _FrozenSeq2PointAdapter(nn.Module):
+    supports_gradient = True
+
     def __init__(self, baseline: Seq2Point):
         super().__init__()
         if not isinstance(baseline, Seq2Point):
@@ -49,6 +51,27 @@ class _FrozenSeq2PointAdapter(nn.Module):
     def assert_baseline_frozen(self) -> None:
         if any(parameter.requires_grad for parameter in self.baseline.parameters()):
             raise RuntimeError("Seq2Point must remain frozen while training a FiLM adapter.")
+
+    def get_window_size(self) -> int:
+        return self.baseline.get_window_size()
+
+    def get_output_size(self) -> int:
+        return self.baseline.get_output_size()
+
+    def get_output_offset(self) -> int:
+        return self.baseline.get_output_offset()
+
+    def get_target_type(self) -> str:
+        return self.baseline.get_target_type()
+
+    def get_init_kwargs(self) -> dict:
+        return self.baseline.get_init_kwargs()
+
+    def prepare_targets(self, targets: torch.Tensor) -> torch.Tensor:
+        return self.baseline.prepare_targets(targets)
+
+    def prepare_outputs(self, outputs: torch.Tensor) -> torch.Tensor:
+        return self.baseline.prepare_outputs(outputs)
 
     def _apply_film(
         self,
