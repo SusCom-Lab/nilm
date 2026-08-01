@@ -13,6 +13,6 @@ dataset/
 # 忽略所有doc文件
 docs/
 # 忽略实验文件
-experiment/
+experiments/
 # 忽略所有log文件
 logs/
