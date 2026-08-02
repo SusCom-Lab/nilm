@@ -1,9 +1,9 @@
 # main.py
-import json
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-from model_pipeline import finetune_model, get_model_entry, list_models, train_model, test_model
+from model_pipeline import get_model_entry, list_models, train_model, test_model
+from model_pipeline.api import OFFICIAL_EXPERIMENT_SEEDS
 from model_pipeline.model_registry import load_checkpoint
 from IPython import get_ipython
 
@@ -163,25 +163,6 @@ def promptModelSelection():
     return numbered_models[model_num]
 
 
-def promptModelConfig(model_name: str):
-    entry = get_model_entry(model_name)
-    default_window = getattr(entry.cls, "default_window_size", 599)
-    window_size = _safe_int_input("Input window size", default_window)
-    raw_kwargs = input(
-        "Model init kwargs as JSON dict, or press Enter for defaults "
-        '(example: {"hidden_size": 256, "num_layers": 3}): '
-    ).strip()
-    model_init_kwargs = {}
-    if raw_kwargs:
-        parsed = json.loads(raw_kwargs)
-        if not isinstance(parsed, dict):
-            raise ValueError("Model init kwargs must be a JSON object.")
-        model_init_kwargs = parsed
-
-    model_init_kwargs.pop("window_size", None)
-    return window_size, model_init_kwargs
-
-
 # ---------------------------------------------------------------------
 # CLI wrappers
 # ---------------------------------------------------------------------
@@ -190,7 +171,6 @@ def trainModelCLI():
     using_colab = runningColab()
 
     model_name = promptModelSelection()
-    input_window_length, model_init_kwargs = promptModelConfig(model_name)
     entry = get_model_entry(model_name)
     is_joint_classical = bool(getattr(entry.cls, "is_joint_classical", False))
 
@@ -213,25 +193,22 @@ def trainModelCLI():
     model_save_dir = "/content" if using_colab else os.path.join(os.getcwd(), "saved_models")
     os.makedirs(model_save_dir, exist_ok=True)
 
-    num_epochs = _safe_int_input("Number of epochs", 10)
     crop_value = input("Crop rows per CSV for quick runs (press enter for full data): ").strip()
     crop = int(crop_value) if crop_value else None
-    seed = _safe_int_input("Random seed", 42)
-
-    trainer = train_model.Trainer(
-        model_name=model_name,
-        train_csv_dirs=train_csv_dirs,
-        validation_csv_dirs=validation_csv_dirs,
-        appliance=appliance,
-        dataset=dataset,
-        model_save_dir=model_save_dir,
-        window_length=input_window_length,
-        seed=seed,
-        crop=crop,
-        model_init_kwargs=model_init_kwargs,
-    )
-    trainer.trainModel(num_epochs)
-    trainer.plotLosses()
+    print(f"Using official model defaults and fixed seeds: {OFFICIAL_EXPERIMENT_SEEDS}")
+    for seed in OFFICIAL_EXPERIMENT_SEEDS:
+        trainer = train_model.Trainer(
+            model_name=model_name,
+            train_csv_dirs=train_csv_dirs,
+            validation_csv_dirs=validation_csv_dirs,
+            appliance=appliance,
+            dataset=dataset,
+            model_save_dir=model_save_dir,
+            seed=seed,
+            crop=crop,
+        )
+        trainer.trainModel()
+        trainer.plotLosses()
     print("Model training completed.")
 
 
@@ -245,7 +222,9 @@ def evaluateModelCLI():
         return
 
     checkpoint = load_checkpoint(model_file_path)
-    joint_mode = bool(checkpoint.get("joint_mode", False))
+    joint_mode = bool(
+        getattr(get_model_entry(checkpoint["model_key"]).cls, "is_joint_classical", False)
+    )
 
     if joint_mode:
         print("Joint classical evaluation expects multiple appliance CSVs from the same house.")
@@ -268,13 +247,7 @@ def evaluateModelCLI():
     tester.plotResults()
 
     metrics_result = tester.saveMetrics()
-    if joint_mode:
-        print(metrics_result)
-    else:
-        mae, sae, inference_time = metrics_result
-        print(f"MAE: {mae:.2f} Watts")
-        print(f"SAE: {sae:.2f}")
-        print(f"Inference time: {inference_time:.2f} seconds")
+    print(metrics_result.to_string(index=False))
     print("Model testing completed.")
 
 
@@ -288,6 +261,11 @@ def fineTuneModelCLI():
         return
     finetune_csv_dir = finetune_csv_dirs[0]
 
+    validation_csv_dirs = selectCSVFiles("fine-tune validation", using_colab)
+    if not validation_csv_dirs:
+        print("Validation file selection aborted. Exiting.")
+        return
+
     model_file_path = selectModelFile(using_colab)
     if not model_file_path:
         print("No model file selected. Exiting.")
@@ -297,17 +275,17 @@ def fineTuneModelCLI():
     os.makedirs(model_save_dir, exist_ok=True)
 
     dataset = input("Enter the dataset name: ")
-    epochs = int(input("Maximum epochs to fine‑tune (default 50): ") or 50)
-    seed = int(input("Random seed (default 42): ") or 42)
+    seed = int(input(f"Random seed {OFFICIAL_EXPERIMENT_SEEDS} (default 42): ") or 42)
 
-    finetuner = finetune_model.Finetuner(
+    finetuner = train_model.Finetuner(
         model_state_dir=model_file_path,
         finetune_csv_dir=finetune_csv_dir,
+        validation_csv_dirs=validation_csv_dirs,
         dataset=dataset,
         model_save_dir=model_save_dir,
         seed=seed,
     )
-    finetuner.fineTune(max_epochs=epochs)
+    finetuner.fineTune()
     finetuner.plotLosses()
     print("Model fine‑tuning completed.")
 
