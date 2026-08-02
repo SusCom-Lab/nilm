@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.base_model import TorchNILMModel
+from model_pipeline.models.seq2seq.seq2seq import Seq2SeqCNN
 
 
 class Permute(nn.Module):
@@ -67,20 +67,26 @@ class LPpool(nn.Module):
 
 
 @register_model("bert", aliases=("BERT",), display_name="BERT")
-class BERTNILM(TorchNILMModel):
+class BERTNILM(Seq2SeqCNN):
     display_name = "BERT"
     model_family = "transformer"
     target_type = "sequence"
     default_output_size = None
+    default_window_size = 99
+    default_num_epochs = 10
+    official_batch_size = 512
+    official_mains_mean = 1800.0
+    official_mains_std = 600.0
 
-    def __init__(self, *, window_size: int = 99, embed_dim: int = 32, num_heads: int = 2, ff_dim: int = 32, **kwargs):
-        super().__init__(
-            window_size=window_size,
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            ff_dim=ff_dim,
-            **kwargs,
-        )
+    def __init__(self, *, window_size: int = 99, embed_dim: int = 32, num_heads: int = 2, ff_dim: int = 32):
+        nn.Module.__init__(self)
+        if (window_size, embed_dim, num_heads, ff_dim) != (99, 32, 2, 32):
+            raise ValueError("BERT uses its official defaults (99, 32, 2, 32).")
+        self.window_size = window_size
+        self.output_size = window_size
+        self.output_offset = 0
+        self._config = {"window_size": window_size, "embed_dim": embed_dim, "num_heads": num_heads, "ff_dim": ff_dim}
+        self.normalization = None
         pooled_length = ((self.window_size - 2) // 2) + 1
         self.network = nn.Sequential(
             Permute(0, 2, 1),

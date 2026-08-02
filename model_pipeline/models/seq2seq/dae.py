@@ -11,18 +11,30 @@ import torch
 import torch.nn as nn
 
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.base_model import TorchNILMModel
+from model_pipeline.models.seq2seq.seq2seq import Seq2SeqCNN
 
 
 @register_model("dae", aliases=("DAE", "Denoising Auto Encoder"), display_name="DAE")
-class DenoisingAutoEncoder(TorchNILMModel):
+class DenoisingAutoEncoder(Seq2SeqCNN):
     display_name = "DAE"
     model_family = "dae"
     target_type = "sequence"
     default_output_size = None
+    default_window_size = 99
+    default_num_epochs = 10
+    official_batch_size = 512
+    official_mains_mean = 1000.0
+    official_mains_std = 600.0
 
-    def __init__(self, *, window_size: int = 599, **kwargs):
-        super().__init__(window_size=window_size, **kwargs)
+    def __init__(self, *, window_size: int = 99):
+        nn.Module.__init__(self)
+        if window_size != 99:
+            raise ValueError("DAE uses the official window_size=99.")
+        self.window_size = window_size
+        self.output_size = window_size
+        self.output_offset = 0
+        self._config = {"window_size": window_size}
+        self.normalization = None
         flattened = self.window_size * 8
         self.conv1 = nn.Conv1d(1, 8, kernel_size=4, padding="same")
         self.flatten = nn.Flatten()

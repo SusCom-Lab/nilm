@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.base_model import TorchNILMModel
+from model_pipeline.models.seq2seq.seq2seq import Seq2SeqCNN
 
 
 class IdentityBlock(nn.Module):
@@ -62,14 +62,26 @@ class ConvolutionBlock(nn.Module):
 
 
 @register_model("resnet", aliases=("ResNet",), display_name="ResNet")
-class ResNetNILM(TorchNILMModel):
+class ResNetNILM(Seq2SeqCNN):
     display_name = "ResNet"
     model_family = "cnn"
     target_type = "sequence"
     default_output_size = None
+    default_window_size = 299
+    default_num_epochs = 10
+    official_batch_size = 512
+    official_mains_mean = 1800.0
+    official_mains_std = 600.0
 
-    def __init__(self, *, window_size: int = 299, num_filters: int = 30, hidden_dim: int = 1024, **kwargs):
-        super().__init__(window_size=window_size, num_filters=num_filters, hidden_dim=hidden_dim, **kwargs)
+    def __init__(self, *, window_size: int = 299, num_filters: int = 30, hidden_dim: int = 1024):
+        nn.Module.__init__(self)
+        if (window_size, num_filters, hidden_dim) != (299, 30, 1024):
+            raise ValueError("ResNet uses its official defaults (299, 30, 1024).")
+        self.window_size = window_size
+        self.output_size = window_size
+        self.output_offset = 0
+        self._config = {"window_size": window_size, "num_filters": num_filters, "hidden_dim": hidden_dim}
+        self.normalization = None
         self.zero_pad = nn.ZeroPad1d(3)
         self.conv1 = nn.Conv1d(1, num_filters, kernel_size=48, stride=2, padding=0)
         self.bn1 = nn.BatchNorm1d(num_filters)
