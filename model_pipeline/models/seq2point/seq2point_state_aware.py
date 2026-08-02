@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.base_model import TorchNILMModel
+from model_pipeline.models.seq2point.seq2point import Seq2Point
 
 
 def power_to_status(targets: torch.Tensor, threshold: float) -> torch.Tensor:
@@ -24,10 +24,13 @@ def power_to_status(targets: torch.Tensor, threshold: float) -> torch.Tensor:
     aliases=("sa_seq2point", "State-aware Seq2Point", "StateAwareSeq2Point"),
     display_name="StateAwareSeq2Point",
 )
-class StateAwareSeq2Point(TorchNILMModel):
+class StateAwareSeq2Point(Seq2Point):
     display_name = "StateAwareSeq2Point"
     model_family = "seq2point"
     target_type = "point"
+    requires_status_targets = True
+    default_window_size = 599
+    default_num_epochs = 10
 
     def __init__(
         self,
@@ -37,16 +40,19 @@ class StateAwareSeq2Point(TorchNILMModel):
         state_threshold: float = 0.0,
         state_loss_weight: float = 0.1,
         state_pos_weight: float | None = None,
-        **kwargs,
     ):
-        super().__init__(
-            window_size=window_size,
-            hidden_dim=hidden_dim,
-            state_threshold=state_threshold,
-            state_loss_weight=state_loss_weight,
-            state_pos_weight=state_pos_weight,
-            **kwargs,
-        )
+        nn.Module.__init__(self)
+        self.window_size = window_size
+        self.output_size = 1
+        self.output_offset = window_size // 2
+        self._config = {
+            "window_size": window_size,
+            "hidden_dim": hidden_dim,
+            "state_threshold": state_threshold,
+            "state_loss_weight": state_loss_weight,
+            "state_pos_weight": state_pos_weight,
+        }
+        self.normalization = None
         self.state_threshold = float(state_threshold)
         self.state_loss_weight = float(state_loss_weight)
         self.state_pos_weight = None if state_pos_weight is None else float(state_pos_weight)

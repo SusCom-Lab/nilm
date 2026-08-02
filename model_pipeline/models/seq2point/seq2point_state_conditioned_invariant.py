@@ -22,7 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.base_model import TorchNILMModel
+from model_pipeline.models.seq2point.seq2point import Seq2Point
 from model_pipeline.models.seq2point.seq2point_invariant_state_aware import GradientReversal
 
 
@@ -31,10 +31,13 @@ from model_pipeline.models.seq2point.seq2point_invariant_state_aware import Grad
     aliases=("StateConditionedInvariantSeq2Point", "sci_seq2point"),
     display_name="StateConditionedInvariantSeq2Point",
 )
-class StateConditionedInvariantSeq2Point(TorchNILMModel):
+class StateConditionedInvariantSeq2Point(Seq2Point):
     display_name = "StateConditionedInvariantSeq2Point"
     model_family = "seq2point"
     target_type = "point"
+    requires_status_targets = True
+    default_window_size = 599
+    default_num_epochs = 10
 
     def __init__(
         self,
@@ -49,7 +52,6 @@ class StateConditionedInvariantSeq2Point(TorchNILMModel):
         num_domains: int = 2,
         house_loss_weight: float = 0.003,
         grl_lambda: float = 1.0,
-        **kwargs,
     ):
         if state_dim is None and amplitude_dim is None:
             state_dim = hidden_dim // 2
@@ -63,19 +65,18 @@ class StateConditionedInvariantSeq2Point(TorchNILMModel):
         if state_dim <= 0 or amplitude_dim <= 0:
             raise ValueError("state_dim and amplitude_dim must both be positive.")
 
-        super().__init__(
-            window_size=window_size,
-            hidden_dim=hidden_dim,
-            state_dim=state_dim,
-            amplitude_dim=amplitude_dim,
-            state_threshold=state_threshold,
-            state_loss_weight=state_loss_weight,
-            state_pos_weight=state_pos_weight,
-            num_domains=num_domains,
-            house_loss_weight=house_loss_weight,
-            grl_lambda=grl_lambda,
-            **kwargs,
-        )
+        nn.Module.__init__(self)
+        self.window_size = window_size
+        self.output_size = 1
+        self.output_offset = window_size // 2
+        self._config = {
+            "window_size": window_size, "hidden_dim": hidden_dim,
+            "state_dim": state_dim, "amplitude_dim": amplitude_dim,
+            "state_threshold": state_threshold, "state_loss_weight": state_loss_weight,
+            "state_pos_weight": state_pos_weight, "num_domains": num_domains,
+            "house_loss_weight": house_loss_weight, "grl_lambda": grl_lambda,
+        }
+        self.normalization = None
         self.state_dim = state_dim
         self.amplitude_dim = amplitude_dim
         self.state_threshold = float(state_threshold)

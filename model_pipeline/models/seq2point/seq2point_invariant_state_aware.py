@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.base_model import TorchNILMModel
+from model_pipeline.models.seq2point.seq2point import Seq2Point
 from model_pipeline.models.seq2point.seq2point_state_aware import power_to_status
 
 
@@ -32,10 +32,13 @@ class GradientReversal(torch.autograd.Function):
     aliases=("InvariantStateAwareSeq2Point", "isa_seq2point"),
     display_name="InvariantStateAwareSeq2Point",
 )
-class InvariantStateAwareSeq2Point(TorchNILMModel):
+class InvariantStateAwareSeq2Point(Seq2Point):
     display_name = "InvariantStateAwareSeq2Point"
     model_family = "seq2point"
     target_type = "point"
+    requires_status_targets = True
+    default_window_size = 599
+    default_num_epochs = 10
 
     def __init__(
         self,
@@ -48,19 +51,18 @@ class InvariantStateAwareSeq2Point(TorchNILMModel):
         num_domains: int = 2,
         house_loss_weight: float = 0.003,
         grl_lambda: float = 1.0,
-        **kwargs,
     ):
-        super().__init__(
-            window_size=window_size,
-            hidden_dim=hidden_dim,
-            state_threshold=state_threshold,
-            state_loss_weight=state_loss_weight,
-            state_pos_weight=state_pos_weight,
-            num_domains=num_domains,
-            house_loss_weight=house_loss_weight,
-            grl_lambda=grl_lambda,
-            **kwargs,
-        )
+        nn.Module.__init__(self)
+        self.window_size = window_size
+        self.output_size = 1
+        self.output_offset = window_size // 2
+        self._config = {
+            "window_size": window_size, "hidden_dim": hidden_dim,
+            "state_threshold": state_threshold, "state_loss_weight": state_loss_weight,
+            "state_pos_weight": state_pos_weight, "num_domains": num_domains,
+            "house_loss_weight": house_loss_weight, "grl_lambda": grl_lambda,
+        }
+        self.normalization = None
         self.state_threshold = float(state_threshold)
         self.state_loss_weight = float(state_loss_weight)
         self.state_pos_weight = None if state_pos_weight is None else float(state_pos_weight)
