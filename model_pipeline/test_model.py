@@ -14,6 +14,8 @@ from sklearn.metrics import average_precision_score, precision_recall_curve, pre
 from torch.utils.data import DataLoader
 
 from model_pipeline.classical_data import load_grouped_classical_data
+from model_pipeline.contracts import InferenceContext, InferenceData
+from model_pipeline.data_protocol import household_id_from_path
 from model_pipeline.data_feeder import SlidingWindowDataset, reconstruct_series_from_windows
 from model_pipeline.model_registry import instantiate_from_checkpoint, load_checkpoint
 from model_pipeline.train_model import compute_metrics
@@ -420,7 +422,7 @@ class Evaluator:
             self.joint_metrics = pd.DataFrame(metric_rows)
             return
 
-        if self.test_loader is None:
+        if self.test_loader is None and not getattr(self.model, "supports_gradient", False):
             raise ValueError("Evaluator requires a test_loader or test_csv_dir.")
 
         if self.test_csv_dir is not None:
@@ -446,6 +448,66 @@ class Evaluator:
             raise ValueError(
                 "Evaluator requires normalisation_params when test_csv_dir is not provided."
             )
+
+        if getattr(self.model, "supports_gradient", False):
+            household_id = (
+                household_id_from_path(self.test_csv_dir)
+                if self.test_csv_dir is not None
+                else "unknown"
+            )
+            segment_ids = (
+                raw_df["segment_id"].to_numpy()
+                if self.test_csv_dir is not None and "segment_id" in raw_df.columns
+                else None
+            )
+            inference_data = InferenceData(
+                timestamps=np.asarray(raw_timestamps),
+                aggregate=np.asarray(raw_aggregate, dtype=np.float32),
+                household_id=household_id,
+                segment_ids=segment_ids,
+                source=self.test_csv_dir,
+            )
+            inference_context = InferenceContext(
+                device=self.device,
+                batch_size=self.batch_size,
+                normalisation_stats=self.normalisation_params,
+            )
+
+            time_start = time.time()
+            prediction_output = self.model.predict(inference_data, inference_context)
+            self.dt = time.time() - time_start
+            if len(prediction_output.timestamps) != total_length:
+                raise ValueError(
+                    "Model predict() must return the complete protocol test timeline."
+                )
+            if not pd.Index(prediction_output.timestamps).equals(pd.Index(raw_timestamps)):
+                raise ValueError("Model prediction timestamps do not match the test timeline.")
+
+            valid_mask = (
+                np.ones(total_length, dtype=bool)
+                if prediction_output.valid_mask is None
+                else np.asarray(prediction_output.valid_mask, dtype=bool)
+            )
+            self.timestamps = raw_timestamps[valid_mask].reset_index(drop=True)
+            self.aggregate = np.clip(raw_aggregate[valid_mask], 0.0, None).tolist()
+            self.ground_truth = np.clip(raw_target[valid_mask], 0.0, None).tolist()
+            self.true_status = (
+                None
+                if raw_status is None
+                else raw_status[valid_mask].astype(np.int8).tolist()
+            )
+            predictions = np.asarray(prediction_output.power, dtype=np.float32)[valid_mask]
+            predictions = np.minimum(
+                np.clip(predictions, 0.0, None),
+                np.asarray(self.aggregate, dtype=np.float32),
+            )
+            self.predictions = predictions.tolist()
+            test_loss = self.criterion(
+                torch.as_tensor(predictions),
+                torch.as_tensor(self.ground_truth),
+            ).item()
+            print(f"Test Loss: {test_loss}")
+            return
 
         appliance_mean = self.normalisation_params["appliance_mean"]
         appliance_std = self.normalisation_params["appliance_std"]
