@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import random
+from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -14,6 +15,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 from model_pipeline.classical_data import load_grouped_classical_data
+from model_pipeline.contracts import SupervisedData, TrainingContext
 from model_pipeline.data_protocol import build_train_validation_splits
 from model_pipeline.data_feeder import SlidingWindowDataset
 from model_pipeline.model_registry import create_model
@@ -206,6 +208,12 @@ class Trainer:
         self.crop = crop
         self.train_csv_dirs = train_csv_dirs
         self.validation_csv_dirs = validation_csv_dirs
+        self.train_household_split = None
+        self.validation_household_split = None
+        if train_csv_dirs and validation_csv_dirs:
+            self.train_household_split, self.validation_household_split = (
+                build_train_validation_splits(train_csv_dirs, validation_csv_dirs)
+            )
         self.joint_classical_data = None
         self.normalisation_stats = None if normalisation_stats is None else dict(normalisation_stats)
         appliance_on_threshold, min_on_rate = resolve_appliance_filter_settings(
@@ -371,6 +379,48 @@ class Trainer:
         torch.save(checkpoint, path)
         return path
 
+    def _plugin_checkpoint_callback(
+        self,
+        *,
+        model,
+        epoch,
+        train_loss,
+        validation_loss,
+        selection_loss,
+        record,
+    ):
+        if model is not self.model:
+            raise ValueError("Checkpoint callback received a different model instance.")
+
+        self.current_epoch = int(epoch)
+        self.current_selection_loss = float(selection_loss)
+        if train_loss is not None:
+            self.train_losses.append(float(train_loss))
+        self.val_losses.append(float(validation_loss))
+        self.selection_losses.append(float(selection_loss))
+        self.epoch_history.append(dict(record))
+
+        saved = False
+        checkpoint_path = None
+        if selection_loss < self.best_val_loss - self.min_delta:
+            self.best_val_loss = float(selection_loss)
+            self.best_epoch = int(epoch)
+            checkpoint_path = self._save_checkpoint()
+            self.counter = 0
+            saved = True
+            print(f"Validation improved. Checkpoint saved to {checkpoint_path}")
+        else:
+            self.counter += 1
+
+        should_stop = self._should_early_stop(epoch)
+        if should_stop:
+            print(f"Early stopping triggered after {epoch} epochs.")
+        return {
+            "saved": saved,
+            "checkpoint_path": checkpoint_path,
+            "should_stop": should_stop,
+        }
+
     def _validate_torch(self):
         if self.validation_loader is None:
             return None, None
@@ -441,88 +491,34 @@ class Trainer:
                 f"num_epochs ({num_epochs}) must be >= minimum_epochs ({self.minimum_epochs})."
             )
 
-        if self.select_epoch_zero and self.validation_loader is not None:
-            val_loss, selection_loss = self._validate_torch()
-            self.current_epoch = 0
-            self.current_selection_loss = selection_loss
-            self.best_val_loss = selection_loss
-            self.best_epoch = 0
-            self.val_losses.append(val_loss)
-            self.selection_losses.append(selection_loss)
-            self.epoch_history.append(
-                {
-                    "epoch": 0,
-                    "validation_mse": val_loss,
-                    "selection_loss": selection_loss,
-                    "checkpoint_eligible": True,
-                }
-            )
-            checkpoint_path = self._save_checkpoint()
-            print(f"Epoch 0 identity checkpoint saved to {checkpoint_path}")
-
-        for epoch in range(num_epochs):
-            batch_sampler = getattr(self.train_loader, "batch_sampler", None)
-            set_epoch = getattr(batch_sampler, "set_epoch", None)
-            if callable(set_epoch):
-                set_epoch(epoch + 1)
-            self.model.train()
-            train_loss = 0.0
-            for batch in self.train_loader:
-                inputs, targets = self._prepare_loader_batch(batch)
-                self.optimizer.zero_grad()
-                loss, _ = self._torch_loss(inputs, targets)
-                loss.backward()
-                if self.gradient_clip_norm is not None:
-                    nn.utils.clip_grad_norm_(
-                        [
-                            parameter
-                            for parameter in self.model.parameters()
-                            if parameter.requires_grad
-                        ],
-                        self.gradient_clip_norm,
-                    )
-                self.optimizer.step()
-                train_loss += loss.item()
-
-            train_loss /= max(1, len(self.train_loader))
-
-            val_loss = train_loss
-            selection_loss = val_loss
-            if self.validation_loader is not None:
-                val_loss, selection_loss = self._validate_torch()
-
-            print(
-                f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss}, "
-                f"Val Loss: {val_loss}, Selection Loss: {selection_loss}"
-            )
-
-            self.train_losses.append(train_loss)
-            self.val_losses.append(val_loss)
-            self.selection_losses.append(selection_loss)
-            self.current_epoch = epoch + 1
-            self.current_selection_loss = selection_loss
-            self.epoch_history.append(
-                {
-                    "epoch": epoch + 1,
-                    "train_mse": train_loss,
-                    "validation_mse": val_loss,
-                    "selection_loss": selection_loss,
-                    "checkpoint_eligible": True,
-                }
-            )
-            self.scheduler.step(selection_loss)
-
-            if selection_loss < self.best_val_loss - self.min_delta:
-                self.best_val_loss = selection_loss
-                self.best_epoch = epoch + 1
-                checkpoint_path = self._save_checkpoint()
-                print(f"Validation improved. Checkpoint saved to {checkpoint_path}")
-                self.counter = 0
-            else:
-                self.counter += 1
-                if self._should_early_stop(epoch + 1):
-                    print(f"Early stopping triggered after {epoch + 1} epochs.")
-                    break
+        train_data = SupervisedData(
+            household_split=self.train_household_split,
+            loader=self.train_loader,
+            normalisation_stats=self.normalisation_stats,
+        )
+        validation_data = SupervisedData(
+            household_split=self.validation_household_split,
+            loader=self.validation_loader,
+            normalisation_stats=self.normalisation_stats,
+        )
+        checkpoint_path = Path(self.model_save_dir) / (
+            f"{self.appliance}_{self.dataset}_{self.model_name}.pth"
+        )
+        context = TrainingContext(
+            device=self.device,
+            seed=self.seed,
+            num_epochs=int(num_epochs),
+            checkpoint_path=checkpoint_path,
+            checkpoint_callback=self._plugin_checkpoint_callback,
+            config={
+                "criterion": self.criterion,
+                "optimizer": self.optimizer,
+                "scheduler": self.scheduler,
+                "gradient_clip_norm": self.gradient_clip_norm,
+                "select_epoch_zero": self.select_epoch_zero,
+            },
+        )
+        return self.model.fit(train_data, validation_data, context)
 
     def plotLosses(self):
         if not self.train_losses:
