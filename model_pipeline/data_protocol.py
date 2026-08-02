@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections.abc import Iterable
@@ -20,6 +21,109 @@ from model_pipeline.api import (
 
 
 HOUSEHOLD_PATTERN = re.compile(r"(?:^|_)H(?P<house>\d+)(?:_|\.|$)", re.IGNORECASE)
+STATUS_RULES_FILE = os.path.join(os.path.dirname(__file__), "appliance_status_rules.json")
+APPLIANCE_ALIASES = {
+    "refrigerator": "fridge",
+    "washingmachine": "washing_machine",
+    "washerdryer": "washing_machine",
+    "washer_dryer": "washing_machine",
+}
+
+
+def normalize_appliance_name(appliance: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "_", str(appliance).strip().lower()).strip("_")
+    compact = key.replace("_", "")
+    return APPLIANCE_ALIASES.get(key, APPLIANCE_ALIASES.get(compact, key))
+
+
+def get_appliance_status_rule(appliance: str) -> dict[str, float] | None:
+    """Return the public status-label rule shared by every model."""
+
+    with open(STATUS_RULES_FILE, encoding="utf-8") as stream:
+        rules = json.load(stream)
+    rule = rules.get(normalize_appliance_name(appliance))
+    return None if rule is None else {key: float(value) for key, value in rule.items()}
+
+
+def _filter_short_runs(status: np.ndarray, value: bool, minimum_samples: int) -> None:
+    if minimum_samples <= 1:
+        return
+    start = 0
+    while start < len(status):
+        end = start + 1
+        while end < len(status) and status[end] == status[start]:
+            end += 1
+        is_edge_off_run = not value and (start == 0 or end == len(status))
+        if (
+            bool(status[start]) == value
+            and end - start < minimum_samples
+            and not is_edge_off_run
+        ):
+            status[start:end] = not value
+        start = end
+
+
+def appliance_status_from_power(
+    timestamps: np.ndarray,
+    power: np.ndarray,
+    appliance: str,
+    segment_ids: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """Create common status truth without exposing model-specific label rules."""
+
+    rule = get_appliance_status_rule(appliance)
+    if rule is None:
+        return None
+    segments = (
+        np.zeros(len(power), dtype=np.int64) if segment_ids is None else np.asarray(segment_ids)
+    )
+    result = np.zeros(len(power), dtype=np.float32)
+    start = 0
+    while start < len(power):
+        end = start + 1
+        while end < len(power) and segments[end] == segments[start]:
+            end += 1
+        values = np.asarray(power[start:end])
+        state = (values >= rule["min_threshold"]) & (values <= rule["max_threshold"])
+        times = pd.to_datetime(np.asarray(timestamps[start:end]))
+        if len(times) > 1:
+            deltas = np.diff(times.view("int64")) / 1_000_000_000.0
+            positive = deltas[deltas > 0]
+            sample_seconds = float(np.median(positive)) if len(positive) else 1.0
+        else:
+            sample_seconds = 1.0
+        min_off = int(np.ceil(rule["min_off_duration"] / sample_seconds))
+        min_on = int(np.ceil(rule["min_on_duration"] / sample_seconds))
+        _filter_short_runs(state, False, min_off)
+        _filter_short_runs(state, True, min_on)
+        result[start:end] = state.astype(np.float32)
+        start = end
+    return result
+
+
+def _with_common_status(series: SupervisedSeries) -> SupervisedSeries:
+    columns = [
+        appliance_status_from_power(
+            series.timestamps,
+            series.appliance_power[:, index],
+            appliance,
+            series.segment_ids,
+        )
+        for index, appliance in enumerate(series.appliances)
+    ]
+    if all(column is not None for column in columns):
+        status = np.stack(columns, axis=1).astype(np.float32)
+    else:
+        status = series.status
+    return SupervisedSeries(
+        timestamps=series.timestamps,
+        aggregate=series.aggregate,
+        appliance_power=series.appliance_power,
+        appliances=series.appliances,
+        household_id=series.household_id,
+        segment_ids=series.segment_ids,
+        status=status,
+    )
 
 
 def same_csv_dataset(left_paths: Iterable[str], right_paths: Iterable[str]) -> bool:
@@ -175,14 +279,16 @@ def load_supervised_partition(
         if len(status_columns) == len(appliances):
             status = base[status_columns].to_numpy(dtype=np.float32)
         series_items.append(
-            SupervisedSeries(
-                timestamps=base["timestamp"].to_numpy(),
-                aggregate=base["aggregate"].to_numpy(dtype=np.float32),
-                appliance_power=base[list(appliances)].to_numpy(dtype=np.float32),
-                appliances=appliances,
-                household_id=household_id,
-                segment_ids=base["segment_id"].to_numpy(),
-                status=status,
+            _with_common_status(
+                SupervisedSeries(
+                    timestamps=base["timestamp"].to_numpy(),
+                    aggregate=base["aggregate"].to_numpy(dtype=np.float32),
+                    appliance_power=base[list(appliances)].to_numpy(dtype=np.float32),
+                    appliances=appliances,
+                    household_id=household_id,
+                    segment_ids=base["segment_id"].to_numpy(),
+                    status=status,
+                )
             )
         )
 
@@ -226,8 +332,10 @@ def split_supervised_partition(
                 status=None if series.status is None else series.status[start:end],
             )
 
-        train_series.append(sliced(0, split_index))
-        validation_series.append(sliced(split_index, len(series.timestamps)))
+        train_series.append(_with_common_status(sliced(0, split_index)))
+        validation_series.append(
+            _with_common_status(sliced(split_index, len(series.timestamps)))
+        )
 
     household_ids = tuple(series.household_id for series in partition.series)
     return (
@@ -298,10 +406,13 @@ __all__ = [
     "HOUSEHOLD_PATTERN",
     "build_train_validation_splits",
     "build_evaluation_target",
+    "appliance_status_from_power",
+    "get_appliance_status_rule",
     "household_id_from_path",
     "hide_partition_targets",
     "load_supervised_partition",
     "make_household_split",
+    "normalize_appliance_name",
     "same_csv_dataset",
     "split_supervised_partition",
     "validate_disjoint_households",

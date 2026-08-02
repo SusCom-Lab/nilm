@@ -146,6 +146,7 @@ class TrainingContext:
     seed: int
     num_epochs: int
     validate_candidate: Callable[..., ValidationResult]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

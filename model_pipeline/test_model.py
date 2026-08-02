@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 import os
-import re
 import time
 
 import matplotlib.pyplot as plt
@@ -15,6 +13,7 @@ import torch
 from model_pipeline.api import InferenceContext
 from model_pipeline.data_protocol import (
     build_evaluation_target,
+    get_appliance_status_rule,
     hide_partition_targets,
     load_supervised_partition,
 )
@@ -22,24 +21,16 @@ from model_pipeline.model_registry import create_model, load_checkpoint
 from model_pipeline.train_model import _aligned_prediction
 
 
-STATUS_RULES_FILE = os.path.join(os.path.dirname(__file__), "appliance_status_rules.json")
 METRIC_NAMES = ("MAE", "SAE", "Precision", "Recall", "F1", "MAE-on", "MAE-off")
 
 
-def _normalise_name(name: str) -> str:
-    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(name))
-    return re.sub(r"[^0-9A-Za-z]+", "_", value).strip("_").lower()
-
-
 def _status_threshold(appliance: str) -> float:
-    with open(STATUS_RULES_FILE, "r", encoding="utf-8") as handle:
-        rules = json.load(handle)
-    key = _normalise_name(appliance)
-    if key not in rules:
+    rule = get_appliance_status_rule(appliance)
+    if rule is None:
         raise KeyError(
             f"No public status threshold is configured for appliance '{appliance}'."
         )
-    return float(rules[key]["status_threshold"])
+    return rule["status_threshold"]
 
 
 def compute_metrics(

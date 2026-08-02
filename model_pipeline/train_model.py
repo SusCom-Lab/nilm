@@ -190,6 +190,15 @@ class Trainer:
             seed=self.seed,
             num_epochs=self.num_epochs,
             validate_candidate=self._validate_candidate,
+            metadata={
+                "dataset": self.dataset,
+                "appliance": self.appliance,
+                "split_strategy": (
+                    "chronological_80_20"
+                    if self.shared_dataset_split
+                    else "disjoint_households"
+                ),
+            },
         )
         result = self.model.fit(self.train_data, self.validation_input, context)
         self.epoch_history = list(result.history)
