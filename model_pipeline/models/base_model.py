@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import os
 from typing import Any
 
 import numpy as np
@@ -59,6 +60,42 @@ class BaseNILMModel(ABC):
 
     def get_init_kwargs(self) -> dict[str, Any]:
         return dict(self._config)
+
+    def fit(self, train_data, validation_data, context):
+        """Train this model using its private, source-faithful recipe.
+
+        Concrete plugins own their Dataset, loss, optimiser, scheduler, and
+        epoch loop.  The experiment runner only supplies fixed household
+        partitions and checkpoint services through ``context``.
+        """
+
+        del train_data, validation_data, context
+        raise NotImplementedError(f"{self.__class__.__name__} must implement fit().")
+
+    def predict(self, inference_data, context):
+        """Return a timestamp-aligned ``PredictionOutput`` for inference data."""
+
+        del inference_data, context
+        raise NotImplementedError(f"{self.__class__.__name__} must implement predict().")
+
+    def save(self, path: str | os.PathLike[str]) -> str:
+        """Persist the model-owned state without changing repository paths."""
+
+        path = os.fspath(path)
+        torch.save(self.export_state(), path)
+        return path
+
+    def load(self, path: str | os.PathLike[str], map_location: str | None = None) -> None:
+        """Load state saved by :meth:`save` or a repository checkpoint."""
+
+        path = os.fspath(path)
+        try:
+            payload = torch.load(path, map_location=map_location, weights_only=False)
+        except TypeError:
+            payload = torch.load(path, map_location=map_location)
+        if isinstance(payload, dict):
+            payload = payload.get("model_state", payload.get("model_state_dict", payload))
+        self.load_exported_state(payload, map_location=map_location)
 
     def prepare_targets(self, targets: torch.Tensor | np.ndarray) -> torch.Tensor | np.ndarray:
         if isinstance(targets, torch.Tensor):
