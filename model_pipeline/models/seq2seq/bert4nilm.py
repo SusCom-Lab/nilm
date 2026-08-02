@@ -22,21 +22,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from model_pipeline.api import FitResult, TrainingContext
+from model_pipeline.api import (
+    FitResult,
+    InferenceContext,
+    PredictionOutput,
+    TrainingContext,
+)
+from model_pipeline.data_protocol import (
+    get_appliance_status_rule,
+    normalize_appliance_name,
+)
 from model_pipeline.model_registry import register_model
 from model_pipeline.models.seq2seq.seq2seq import Seq2SeqCNN
 
 
 class BERT4NILMDataset(Dataset):
-    """Centered official windows with aligned power/status supervision."""
+    """Official forward windows with aligned power/status supervision."""
 
-    def __init__(self, partition, window_size, stats):
+    def __init__(self, partition, window_size, stride, stats):
         self.inputs = []
         self.targets = []
-        half = window_size // 2
         for series in partition.series:
             if len(series.appliances) != 1 or series.status is None:
-                raise ValueError("BERT4NILM requires one appliance and a status column.")
+                raise ValueError("BERT4NILM requires one appliance and public status labels.")
             segments = series.segment_ids
             if segments is None:
                 segments = np.zeros(len(series.aggregate), dtype=np.int64)
@@ -45,25 +53,91 @@ class BERT4NILMDataset(Dataset):
                 end = start + 1
                 while end < len(series.aggregate) and segments[end] == segments[start]:
                     end += 1
-                mains = np.pad(series.aggregate[start:end], (half, half))
-                power = np.pad(series.appliance_power[start:end, 0], (half, half))
-                status = np.pad(series.status[start:end, 0], (half, half))
-                for index in range(end - start):
-                    self.inputs.append(torch.as_tensor(
-                        (mains[index:index + window_size] - stats["mains_mean"])
-                        / stats["mains_std"], dtype=torch.float32
-                    ))
-                    normalized_power = (
-                        power[index:index + window_size] - stats["appliance_mean"]
-                    ) / stats["appliance_std"]
-                    self.targets.append(torch.as_tensor(
-                        np.stack((normalized_power, status[index:index + window_size]), axis=-1),
-                        dtype=torch.float32,
-                    ))
+                mains = _official_energy(series.aggregate[start:end], stats["aggregate_cutoff"])
+                power = _official_energy(
+                    series.appliance_power[start:end, 0], stats["power_cutoff"]
+                )
+                status = series.status[start:end, 0]
+                for offset in _forward_window_starts(len(mains), window_size, stride):
+                    valid = min(window_size, len(mains) - offset)
+                    input_window = np.zeros(window_size, dtype=np.float32)
+                    power_window = np.zeros(window_size, dtype=np.float32)
+                    status_window = np.zeros(window_size, dtype=np.float32)
+                    input_window[:valid] = (
+                        mains[offset : offset + valid] - stats["mains_mean"]
+                    ) / stats["mains_std"]
+                    power_window[:valid] = power[offset : offset + valid]
+                    status_window[:valid] = status[offset : offset + valid]
+                    power_window /= stats["power_cutoff"]
+                    self.inputs.append(torch.as_tensor(input_window, dtype=torch.float32))
+                    self.targets.append(
+                        torch.as_tensor(
+                            np.stack((power_window, status_window), axis=-1),
+                            dtype=torch.float32,
+                        )
+                    )
                 start = end
 
     def __len__(self): return len(self.inputs)
     def __getitem__(self, index): return self.inputs[index], self.targets[index]
+
+
+def _official_energy(values, cutoff):
+    values = np.clip(np.asarray(values, dtype=np.float32), 0.0, float(cutoff)).copy()
+    values[values < 5.0] = 0.0
+    return values
+
+
+def _forward_window_starts(length: int, window_size: int, stride: int) -> list[int]:
+    if length <= window_size:
+        return [0]
+    count = int(np.ceil((length - window_size) / stride)) + 1
+    return [index * stride for index in range(count)]
+
+
+OFFICIAL_RECIPES = {
+    "redd": {
+        "stride": 120,
+        "cutoff": {
+            "fridge": 400.0,
+            "washing_machine": 3500.0,
+            "microwave": 1800.0,
+            "dishwasher": 1200.0,
+        },
+        "c0": {
+            "fridge": 1e-6,
+            "washing_machine": 0.001,
+            "microwave": 1.0,
+            "dishwasher": 1.0,
+        },
+    },
+    "ukdale": {
+        "stride": 240,
+        "cutoff": {
+            "kettle": 3100.0,
+            "fridge": 300.0,
+            "washing_machine": 2500.0,
+            "microwave": 3000.0,
+            "dishwasher": 2500.0,
+        },
+        "c0": {
+            "kettle": 1.0,
+            "fridge": 1e-6,
+            "washing_machine": 0.01,
+            "microwave": 1.0,
+            "dishwasher": 1.0,
+        },
+    },
+}
+
+
+def _dataset_key(value: str) -> str:
+    compact = "".join(character for character in str(value).lower() if character.isalnum())
+    if compact.startswith("redd"):
+        return "redd"
+    if compact in {"ukdale", "ukdalelowfrequency"}:
+        return "ukdale"
+    return compact
 
 
 class GELU(nn.Module):
@@ -203,6 +277,15 @@ class BERT4NILM(Seq2SeqCNN):
         num_layers: int = 2,
         dropout: float = 0.1,
         appliance_output_size: int = 1,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.0,
+        mask_probability: float = 0.25,
+        temperature: float = 0.1,
+        aggregate_cutoff: float = 6000.0,
+        power_cutoff: float | None = None,
+        status_threshold: float | None = None,
+        train_stride: int | None = None,
+        c0: float | None = None,
     ):
         nn.Module.__init__(self)
         if window_size < 2 or window_size % 2:
@@ -211,6 +294,12 @@ class BERT4NILM(Seq2SeqCNN):
             raise ValueError("BERT4NILM hidden_dim must be divisible by num_heads.")
         if num_layers < 1 or not 0.0 <= dropout < 1.0 or appliance_output_size < 1:
             raise ValueError("BERT4NILM layer counts must be positive and dropout must be in [0, 1).")
+        if learning_rate <= 0 or weight_decay < 0 or not 0 < mask_probability <= 1:
+            raise ValueError("Invalid BERT4NILM optimiser or mask configuration.")
+        if aggregate_cutoff <= 0 or (power_cutoff is not None and power_cutoff <= 0):
+            raise ValueError("BERT4NILM cutoffs must be positive.")
+        if train_stride is not None and train_stride < 1:
+            raise ValueError("BERT4NILM train_stride must be positive.")
         self.window_size = window_size
         self.output_size = window_size
         self.output_offset = 0
@@ -218,9 +307,17 @@ class BERT4NILM(Seq2SeqCNN):
             "window_size": window_size, "hidden_dim": hidden_dim,
             "num_heads": num_heads, "num_layers": num_layers,
             "dropout": dropout, "appliance_output_size": appliance_output_size,
-            "learning_rate": 1e-4, "weight_decay": 0.0,
-            "mask_probability": 0.25, "temperature": 0.1,
-            "on_power_threshold": 15.0, "c0": 1.0,
+            "learning_rate": learning_rate, "weight_decay": weight_decay,
+            "mask_probability": mask_probability, "temperature": temperature,
+            "aggregate_cutoff": aggregate_cutoff,
+            "power_cutoff": power_cutoff, "status_threshold": status_threshold,
+            "train_stride": train_stride, "c0": c0,
+        }
+        self._recipe_overrides = {
+            "power_cutoff": power_cutoff,
+            "status_threshold": status_threshold,
+            "train_stride": train_stride,
+            "c0": c0,
         }
         self.normalization = None
         self.hidden = int(hidden_dim)
@@ -301,6 +398,63 @@ class BERT4NILM(Seq2SeqCNN):
             )
         return targets[..., 0].float(), targets[..., 1].float()
 
+    def _set_official_normalization(self, train_data, context: TrainingContext) -> None:
+        appliance = normalize_appliance_name(train_data.series[0].appliances[0])
+        dataset = _dataset_key(context.metadata.get("dataset", ""))
+        recipe = OFFICIAL_RECIPES.get(dataset)
+        public_rule = get_appliance_status_rule(appliance)
+        cutoff = self._recipe_overrides["power_cutoff"]
+        if cutoff is None and recipe is not None:
+            cutoff = recipe["cutoff"].get(appliance)
+        if cutoff is None and public_rule is not None:
+            cutoff = public_rule["max_threshold"]
+        if cutoff is None:
+            raise ValueError(
+                f"BERT4NILM has no official power cutoff for '{appliance}'; "
+                "provide power_cutoff through the model CLI parameters."
+            )
+        threshold = self._recipe_overrides["status_threshold"]
+        if threshold is None and public_rule is not None:
+            threshold = public_rule["status_threshold"]
+        if threshold is None:
+            raise ValueError(f"No public status threshold exists for '{appliance}'.")
+        stride = self._recipe_overrides["train_stride"]
+        if stride is None:
+            stride = recipe["stride"] if recipe is not None else 120
+        c0 = self._recipe_overrides["c0"]
+        if c0 is None and recipe is not None:
+            c0 = recipe["c0"].get(appliance)
+        if c0 is None:
+            c0 = OFFICIAL_RECIPES["ukdale"]["c0"].get(appliance, 1.0)
+
+        aggregate_cutoff = float(self._config["aggregate_cutoff"])
+        aggregate = np.concatenate(
+            [
+                _official_energy(series.aggregate, aggregate_cutoff)
+                for series in train_data.series
+            ]
+        )
+        mains_std = float(np.std(aggregate))
+        if not np.isfinite(mains_std) or mains_std <= 0:
+            mains_std = 1.0
+        self.normalization = {
+            "mains_mean": float(np.mean(aggregate)),
+            "mains_std": mains_std,
+            "aggregate_cutoff": aggregate_cutoff,
+            "power_cutoff": float(cutoff),
+            "status_threshold": float(threshold),
+            "train_stride": int(stride),
+            "c0": float(c0),
+            "appliances": train_data.series[0].appliances,
+            "recipe_dataset": dataset or "custom",
+        }
+        self._config.update(
+            power_cutoff=float(cutoff),
+            status_threshold=float(threshold),
+            train_stride=int(stride),
+            c0=float(c0),
+        )
+
     def _masked_batch_loss(self, inputs, targets, stats):
         power_targets, status_targets = self._split_supervised_targets(targets)
         mask_probability = float(self._config.get("mask_probability", 0.25))
@@ -329,10 +483,10 @@ class BERT4NILM(Seq2SeqCNN):
         )
         mse_loss = F.mse_loss(selected_outputs, selected_power)
 
-        target_mean = float(stats["appliance_mean"])
-        target_std = float(stats["appliance_std"])
-        threshold = float(self._config.get("on_power_threshold", 15.0))
-        raw_outputs = selected_outputs * target_std + target_mean
+        threshold = float(stats["status_threshold"])
+        raw_outputs = selected_outputs * float(stats["power_cutoff"])
+        raw_outputs = torch.clamp(raw_outputs, min=0.0, max=float(stats["power_cutoff"]))
+        raw_outputs = torch.where(raw_outputs < 5.0, 0.0, raw_outputs)
         predicted_status = (raw_outputs >= threshold).to(selected_outputs.dtype)
         margin_loss = F.soft_margin_loss(
             predicted_status * 2.0 - 1.0,
@@ -347,7 +501,7 @@ class BERT4NILM(Seq2SeqCNN):
                 selected_power[on_mask],
                 reduction="sum",
             )
-            total_loss = total_loss + float(self._config.get("c0", 1.0)) * (
+            total_loss = total_loss + float(stats["c0"]) * (
                 on_loss / selected.numel()
             )
         return total_loss
@@ -356,13 +510,17 @@ class BERT4NILM(Seq2SeqCNN):
         """Run the official mask/corruption and composite-loss training recipe."""
 
         del validation_data
-        self._set_normalization(train_data)
+        self._set_official_normalization(train_data, context)
         stats = self.normalization
         train_loader = DataLoader(
-            BERT4NILMDataset(train_data, self.window_size, stats),
+            BERT4NILMDataset(
+                train_data,
+                self.window_size,
+                int(stats["train_stride"]),
+                stats,
+            ),
             batch_size=self.official_batch_size,
-            shuffle=True,
-            generator=torch.Generator().manual_seed(context.seed),
+            shuffle=False,
         )
 
         self.to(context.device)
@@ -427,4 +585,65 @@ class BERT4NILM(Seq2SeqCNN):
             best_epoch=best_epoch,
             best_validation_mse=best_score,
             checkpoint_path=checkpoint_path,
+        )
+
+    def _predict_segment(self, aggregate, context: InferenceContext) -> np.ndarray:
+        stats = self.normalization
+        mains = _official_energy(aggregate, stats["aggregate_cutoff"])
+        starts = _forward_window_starts(len(mains), self.window_size, self.window_size)
+        windows = np.zeros((len(starts), self.window_size), dtype=np.float32)
+        valid_lengths = []
+        for index, start in enumerate(starts):
+            valid = min(self.window_size, len(mains) - start)
+            valid_lengths.append(valid)
+            windows[index, :valid] = (
+                mains[start : start + valid] - stats["mains_mean"]
+            ) / stats["mains_std"]
+
+        predicted = []
+        with torch.inference_mode():
+            for offset in range(0, len(windows), context.batch_size):
+                inputs = torch.as_tensor(
+                    windows[offset : offset + context.batch_size],
+                    dtype=torch.float32,
+                    device=context.device,
+                )
+                predicted.append(self(inputs).cpu().numpy())
+        power = np.concatenate(predicted, axis=0) * float(stats["power_cutoff"])
+        power[power < 5.0] = 0.0
+        power = np.clip(power, 0.0, float(stats["power_cutoff"]))
+        power *= power >= float(stats["status_threshold"])
+        return np.concatenate(
+            [window[:valid] for window, valid in zip(power, valid_lengths)]
+        )[: len(aggregate)].astype(np.float32)
+
+    def predict(self, inference_data, context: InferenceContext) -> PredictionOutput:
+        if self.normalization is None:
+            raise RuntimeError("BERT4NILM must be fitted or loaded before prediction.")
+        self.to(context.device)
+        self.eval()
+        timestamps, households, predictions = [], [], []
+        for series in inference_data.series:
+            segments = series.segment_ids
+            if segments is None:
+                segments = np.zeros(len(series.aggregate), dtype=np.int64)
+            output = np.empty(len(series.aggregate), dtype=np.float32)
+            start = 0
+            while start < len(series.aggregate):
+                end = start + 1
+                while end < len(series.aggregate) and segments[end] == segments[start]:
+                    end += 1
+                output[start:end] = self._predict_segment(
+                    series.aggregate[start:end], context
+                )
+                start = end
+            timestamps.append(series.timestamps)
+            households.append(np.repeat(series.household_id, len(series.timestamps)))
+            predictions.append(output[:, None])
+        return PredictionOutput(
+            np.concatenate(timestamps),
+            np.concatenate(predictions),
+            tuple(self.normalization["appliances"]),
+            np.concatenate(households),
+            metadata={"inference_window_stride": self.window_size},
         )
