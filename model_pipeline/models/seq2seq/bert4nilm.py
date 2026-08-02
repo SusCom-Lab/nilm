@@ -4,9 +4,12 @@ BERT4NILM architecture adapted to the local NILM model registry.
 Reference implementation:
 https://github.com/Yueeeeeeee/BERT4NILM
 
+Reference revision:
+0e6b652b56e26c93c5396e391a4c100304974b18
+
 The original model predicts an appliance-power sequence from an aggregate
-window. This wrapper keeps that architecture while matching the project's
-sequence-model interface, so the existing Trainer and Evaluator can be reused.
+window. Local adaptations only replace dataset I/O, household splitting,
+checkpoint persistence, and the prediction return contract.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from model_pipeline.contracts import FitResult
 from model_pipeline.model_registry import register_model
 from model_pipeline.models.base_model import TorchNILMModel
 
@@ -141,12 +145,14 @@ class BERT4NILM(TorchNILMModel):
     display_name = "BERT4NILM"
     model_family = "transformer"
     target_type = "sequence"
+    default_window_size = 480
     default_output_size = None
+    requires_status_targets = True
 
     def __init__(
         self,
         *,
-        window_size: int = 599,
+        window_size: int = 480,
         hidden_dim: int = 256,
         num_heads: int = 2,
         num_layers: int = 2,
@@ -233,3 +239,162 @@ class BERT4NILM(TorchNILMModel):
         if self.appliance_output_size == 1:
             return x.squeeze(-1)
         return x
+
+    def _split_supervised_targets(self, targets: torch.Tensor):
+        if targets.ndim != 3 or targets.size(-1) != 2:
+            raise ValueError(
+                "BERT4NILM requires sequence targets containing power and status."
+            )
+        return targets[..., 0].float(), targets[..., 1].float()
+
+    def _masked_batch_loss(self, inputs, targets, stats):
+        power_targets, status_targets = self._split_supervised_targets(targets)
+        mask_probability = float(self._config.get("mask_probability", 0.25))
+        if not 0.0 < mask_probability <= 1.0:
+            raise ValueError("BERT4NILM mask_probability must be in (0, 1].")
+
+        selected = torch.rand_like(inputs) < mask_probability
+        if not bool(selected.any()):
+            selected.reshape(-1)[torch.randint(selected.numel(), (1,), device=inputs.device)] = True
+        corruption = torch.rand_like(inputs)
+        masked_inputs = inputs.clone()
+        masked_inputs[selected & (corruption < 0.8)] = -1.0
+        random_mask = selected & (corruption >= 0.8) & (corruption < 0.9)
+        masked_inputs[random_mask] = torch.randn_like(masked_inputs[random_mask])
+
+        outputs = self(masked_inputs)
+        selected_outputs = outputs[selected].reshape(-1, 1)
+        selected_power = power_targets[selected].reshape(-1, 1)
+        selected_status = status_targets[selected].reshape(-1, 1)
+
+        temperature = float(self._config.get("temperature", 0.1))
+        kl_loss = F.kl_div(
+            F.log_softmax(selected_outputs / temperature, dim=-1),
+            F.softmax(selected_power / temperature, dim=-1),
+            reduction="batchmean",
+        )
+        mse_loss = F.mse_loss(selected_outputs, selected_power)
+
+        target_mean = float(stats["appliance_mean"])
+        target_std = float(stats["appliance_std"])
+        threshold = float(self._config.get("on_power_threshold", 15.0))
+        raw_outputs = selected_outputs * target_std + target_mean
+        predicted_status = (raw_outputs >= threshold).to(selected_outputs.dtype)
+        margin_loss = F.soft_margin_loss(
+            predicted_status * 2.0 - 1.0,
+            selected_status * 2.0 - 1.0,
+        )
+        total_loss = kl_loss + mse_loss + margin_loss
+
+        on_mask = (selected_status == 1) | (selected_status != predicted_status)
+        if bool(on_mask.any()):
+            on_loss = F.l1_loss(
+                selected_outputs[on_mask],
+                selected_power[on_mask],
+                reduction="sum",
+            )
+            total_loss = total_loss + float(self._config.get("c0", 1.0)) * (
+                on_loss / selected.numel()
+            )
+        return total_loss
+
+    def _validation_mse(self, loader, device):
+        if loader is None:
+            return None
+        self.eval()
+        total = 0.0
+        with torch.no_grad():
+            for inputs, targets in loader:
+                inputs = inputs.to(device)
+                power_targets, _ = self._split_supervised_targets(targets.to(device))
+                total += float(F.mse_loss(self(inputs), power_targets).item())
+        return total / max(1, len(loader))
+
+    def fit(self, train_data, validation_data, context) -> FitResult:
+        """Run the official mask/corruption and composite-loss training recipe."""
+
+        train_loader = train_data.loader
+        validation_loader = validation_data.loader
+        stats = train_data.normalisation_stats
+        if train_loader is None or stats is None:
+            raise ValueError("BERT4NILM requires a training loader and training statistics.")
+
+        self.to(context.device)
+        no_decay = ("bias", "layer_norm")
+        named_parameters = list(self.named_parameters())
+        parameter_groups = [
+            {
+                "params": [
+                    parameter
+                    for name, parameter in named_parameters
+                    if not any(token in name for token in no_decay)
+                ],
+                "weight_decay": float(self._config.get("weight_decay", 0.0)),
+            },
+            {
+                "params": [
+                    parameter
+                    for name, parameter in named_parameters
+                    if any(token in name for token in no_decay)
+                ],
+                "weight_decay": 0.0,
+            },
+        ]
+        optimizer = torch.optim.Adam(
+            parameter_groups,
+            lr=float(self._config.get("learning_rate", 1e-4)),
+        )
+        history = []
+        best_epoch = None
+        best_score = None
+        checkpoint_path = None
+
+        for epoch in range(1, int(context.num_epochs) + 1):
+            self.train()
+            total = 0.0
+            for inputs, targets in train_loader:
+                inputs = inputs.to(context.device)
+                targets = targets.to(context.device)
+                optimizer.zero_grad()
+                loss = self._masked_batch_loss(inputs, targets, stats)
+                loss.backward()
+                optimizer.step()
+                total += float(loss.item())
+
+            train_loss = total / max(1, len(train_loader))
+            validation_loss = self._validation_mse(validation_loader, context.device)
+            if validation_loss is None:
+                validation_loss = train_loss
+            record = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "validation_mse": validation_loss,
+                "selection_loss": validation_loss,
+                "checkpoint_eligible": True,
+            }
+            history.append(record)
+            print(
+                f"Epoch {epoch}/{context.num_epochs}, Train Loss: {train_loss}, "
+                f"Val Loss: {validation_loss}, Selection Loss: {validation_loss}"
+            )
+            decision = context.checkpoint_callback(
+                model=self,
+                epoch=epoch,
+                train_loss=train_loss,
+                validation_loss=validation_loss,
+                selection_loss=validation_loss,
+                record=record,
+            ) or {}
+            if decision.get("saved"):
+                best_epoch = epoch
+                best_score = validation_loss
+                checkpoint_path = decision.get("checkpoint_path")
+            if decision.get("should_stop"):
+                break
+
+        return FitResult(
+            best_epoch=best_epoch,
+            best_score=best_score,
+            history=history,
+            checkpoint_path=checkpoint_path,
+        )
