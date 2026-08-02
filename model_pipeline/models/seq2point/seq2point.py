@@ -39,6 +39,7 @@ class Seq2PointDataset(Dataset):
         mains_std: float,
         appliance_mean: float,
         appliance_std: float,
+        include_status: bool = False,
     ) -> None:
         if len(partition.series[0].appliances) != 1:
             raise ValueError("Seq2Point is a single-appliance model.")
@@ -72,7 +73,19 @@ class Seq2PointDataset(Dataset):
                     target = (
                         series.appliance_power[start + index, 0] - appliance_mean
                     ) / appliance_std
-                    self.targets.append(torch.tensor(target, dtype=torch.float32))
+                    if include_status:
+                        if series.status is None:
+                            raise ValueError(
+                                "This model requires a status column in every training CSV."
+                            )
+                        self.targets.append(
+                            torch.tensor(
+                                (target, series.status[start + index, 0]),
+                                dtype=torch.float32,
+                            )
+                        )
+                    else:
+                        self.targets.append(torch.tensor(target, dtype=torch.float32))
                 start = end
 
     def __len__(self) -> int:
@@ -153,6 +166,14 @@ class Seq2Point(nn.Module):
     def decode(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.network[-1](hidden)
 
+    def prepare_targets(self, targets):
+        targets = targets.float() if isinstance(targets, torch.Tensor) else np.asarray(targets, dtype=np.float32)
+        return targets.reshape(-1)
+
+    def prepare_outputs(self, outputs):
+        outputs = outputs.float() if isinstance(outputs, torch.Tensor) else np.asarray(outputs, dtype=np.float32)
+        return outputs.reshape(-1)
+
     def _set_training_normalization(self, train_data: SupervisedPartition) -> None:
         targets = np.concatenate(
             [series.appliance_power[:, 0] for series in train_data.series]
@@ -177,6 +198,14 @@ class Seq2Point(nn.Module):
         del validation_data
         self._set_training_normalization(train_data)
         stats = self.normalization
+        configure_normalization = getattr(self, "set_normalisation_stats", None)
+        if callable(configure_normalization):
+            configure_normalization(
+                {
+                    "appliance_mean": stats["appliance_mean"],
+                    "appliance_std": stats["appliance_std"],
+                }
+            )
         dataset = Seq2PointDataset(
             train_data,
             window_size=self.window_size,
@@ -184,6 +213,7 @@ class Seq2Point(nn.Module):
             mains_std=stats["mains_std"],
             appliance_mean=stats["appliance_mean"],
             appliance_std=stats["appliance_std"],
+            include_status=bool(getattr(self, "requires_status_targets", False)),
         )
         generator = torch.Generator().manual_seed(context.seed)
         loader = DataLoader(
@@ -205,10 +235,14 @@ class Seq2Point(nn.Module):
             total_loss = 0.0
             for inputs, targets in loader:
                 optimizer.zero_grad()
-                loss = criterion(
-                    self(inputs.to(context.device)),
-                    targets.to(context.device),
-                )
+                inputs = inputs.to(context.device)
+                targets = targets.to(context.device)
+                loss_hook = getattr(self, "compute_loss", None)
+                if callable(loss_hook):
+                    loss_output = loss_hook(inputs, targets, criterion=criterion)
+                    loss = loss_output[0] if isinstance(loss_output, tuple) else loss_output
+                else:
+                    loss = criterion(self(inputs), self.prepare_targets(targets))
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
                 optimizer.step()
