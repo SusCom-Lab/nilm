@@ -130,10 +130,8 @@ class AFHMMBaseline:
         sigma_floor: float = 1.0,
         solver: str = "SCS",
     ):
-        if (window_size, n_states, optimisation_epochs, sigma_floor, solver) != (
-            599, 2, 6, 1.0, "SCS"
-        ):
-            raise ValueError("AFHMM uses the fixed repository reference defaults.")
+        if window_size < 1 or n_states < 1 or optimisation_epochs < 1 or sigma_floor <= 0:
+            raise ValueError("AFHMM numeric hyperparameters must be positive.")
         self.window_size = window_size
         self._config = {
             "window_size": window_size,

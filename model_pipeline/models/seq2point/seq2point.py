@@ -115,10 +115,6 @@ class Seq2Point(nn.Module):
 
     def __init__(self, *, window_size: int = 99, hidden_dim: int = 1024) -> None:
         super().__init__()
-        if window_size != self.default_window_size:
-            raise ValueError("Seq2Point uses the official window_size=99.")
-        if hidden_dim != 1024:
-            raise ValueError("Seq2Point uses the official hidden_dim=1024.")
         if window_size % 2 == 0:
             raise ValueError("Seq2Point window_size must be odd.")
         self.window_size = window_size
@@ -127,6 +123,8 @@ class Seq2Point(nn.Module):
         self._config = {"window_size": window_size, "hidden_dim": hidden_dim}
         self.normalization: dict[str, Any] | None = None
         conv_reduction = (10 - 1) + (8 - 1) + (6 - 1) + (5 - 1) + (5 - 1)
+        if window_size <= conv_reduction:
+            raise ValueError(f"Seq2Point window_size must be greater than {conv_reduction}.")
         flattened = 50 * (window_size - conv_reduction)
         self.network = nn.Sequential(
             nn.Conv1d(1, 30, kernel_size=10),

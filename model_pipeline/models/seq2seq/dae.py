@@ -28,8 +28,8 @@ class DenoisingAutoEncoder(Seq2SeqCNN):
 
     def __init__(self, *, window_size: int = 99):
         nn.Module.__init__(self)
-        if window_size != 99:
-            raise ValueError("DAE uses the official window_size=99.")
+        if window_size < 1:
+            raise ValueError("DAE window_size must be positive.")
         self.window_size = window_size
         self.output_size = window_size
         self.output_offset = 0

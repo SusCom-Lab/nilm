@@ -25,8 +25,8 @@ class BiLSTM(RNNBaseline):
 
     def __init__(self, *, window_size: int = 19, hidden_size: int = 128, num_layers: int = 2):
         nn.Module.__init__(self)
-        if (window_size, hidden_size, num_layers) != (19, 128, 2):
-            raise ValueError("BiLSTM uses its fixed reference defaults (19, 128, 2).")
+        if window_size < 1 or hidden_size < 1 or num_layers < 1:
+            raise ValueError("BiLSTM window_size, hidden_size, and num_layers must be positive.")
         self.window_size = window_size
         self.output_size = 1
         self.output_offset = window_size // 2

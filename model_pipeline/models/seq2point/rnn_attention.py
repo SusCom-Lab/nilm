@@ -44,8 +44,8 @@ class RNNAttentionNILM(RNNBaseline):
 
     def __init__(self, *, window_size: int = 19):
         nn.Module.__init__(self)
-        if window_size != 19:
-            raise ValueError("RNN-Attention uses the official window_size=19.")
+        if window_size < 2:
+            raise ValueError("RNN-Attention window_size must be at least 2.")
         self.window_size = window_size
         self.output_size = 1
         self.output_offset = window_size // 2

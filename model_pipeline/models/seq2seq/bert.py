@@ -80,8 +80,10 @@ class BERTNILM(Seq2SeqCNN):
 
     def __init__(self, *, window_size: int = 99, embed_dim: int = 32, num_heads: int = 2, ff_dim: int = 32):
         nn.Module.__init__(self)
-        if (window_size, embed_dim, num_heads, ff_dim) != (99, 32, 2, 32):
-            raise ValueError("BERT uses its official defaults (99, 32, 2, 32).")
+        if window_size < 4 or embed_dim < 1 or num_heads < 1 or ff_dim < 1:
+            raise ValueError("BERT dimensions must be positive and window_size must be at least 4.")
+        if embed_dim % num_heads != 0:
+            raise ValueError("BERT embed_dim must be divisible by num_heads.")
         self.window_size = window_size
         self.output_size = window_size
         self.output_offset = 0

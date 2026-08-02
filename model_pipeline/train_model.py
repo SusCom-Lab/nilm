@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import os
 import random
-from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -78,22 +76,19 @@ class Trainer:
         patience: int = 8,
         min_delta: float = 1e-4,
         model=None,
+        model_init_kwargs: dict[str, Any] | None = None,
+        window_length: int | None = None,
         **legacy_options: Any,
     ) -> None:
-        forbidden = {
-            name: value for name, value in legacy_options.items()
-            if value not in (None, {}, 0.0) and name in {
-                "window_length", "batch_size", "model_init_kwargs", "optimizer",
-                "criterion", "gradient_clip_norm",
-            }
-        }
-        if forbidden:
-            raise ValueError(
-                "Model hyperparameters are fixed to official defaults; remove overrides: "
-                + ", ".join(sorted(forbidden))
-            )
+        if legacy_options:
+            unknown = ", ".join(sorted(legacy_options))
+            raise TypeError(f"Unsupported Trainer options: {unknown}.")
         set_random_seed(seed)
-        self.model = model or create_model(model_name)
+        init_kwargs = dict(model_init_kwargs or {})
+        if window_length is not None:
+            init_kwargs.setdefault("window_size", int(window_length))
+        self.model = model or create_model(model_name, **init_kwargs)
+        self.model_init_kwargs = init_kwargs
         self.model_name = getattr(self.model, "display_name", model_name)
         self.appliance = appliance
         self.appliance_name_formatted = appliance.replace(" ", "_")
@@ -136,7 +131,8 @@ class Trainer:
             "seed": self.seed,
             "train_households": list(self.train_data.household_ids),
             "validation_households": list(self.validation_supervised.household_ids),
-            "official_defaults": True,
+            "model_config": dict(getattr(self.model, "_config", self.model_init_kwargs)),
+            "num_epochs": self.num_epochs,
         }
 
     def _validate_candidate(self, *, epoch: int, model, **_ignored) -> ValidationResult:
@@ -168,14 +164,13 @@ class Trainer:
 
     def trainModel(self, num_epochs: int | None = None):
         official_epochs = int(getattr(self.model, "default_num_epochs", 10))
-        if num_epochs is not None and int(num_epochs) != official_epochs:
-            raise ValueError(
-                f"{self.model_name} uses its official default of {official_epochs} epochs."
-            )
+        self.num_epochs = official_epochs if num_epochs is None else int(num_epochs)
+        if self.num_epochs < 1:
+            raise ValueError("num_epochs must be at least 1.")
         context = TrainingContext(
             device=self.device,
             seed=self.seed,
-            num_epochs=official_epochs,
+            num_epochs=self.num_epochs,
             validate_candidate=self._validate_candidate,
         )
         result = self.model.fit(self.train_data, self.validation_input, context)

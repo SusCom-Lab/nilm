@@ -75,8 +75,8 @@ class ResNetNILM(Seq2SeqCNN):
 
     def __init__(self, *, window_size: int = 299, num_filters: int = 30, hidden_dim: int = 1024):
         nn.Module.__init__(self)
-        if (window_size, num_filters, hidden_dim) != (299, 30, 1024):
-            raise ValueError("ResNet uses its official defaults (299, 30, 1024).")
+        if window_size < 64 or num_filters < 1 or hidden_dim < 1:
+            raise ValueError("ResNet requires window_size >= 64 and positive layer dimensions.")
         self.window_size = window_size
         self.output_size = window_size
         self.output_offset = 0

@@ -86,8 +86,8 @@ class Seq2SeqCNN(nn.Module):
 
     def __init__(self, *, window_size: int = 99, hidden_dim: int = 1024) -> None:
         super().__init__()
-        if window_size != 99 or hidden_dim != 1024:
-            raise ValueError("Seq2Seq uses official window_size=99 and hidden_dim=1024.")
+        if window_size < 77 or hidden_dim < 1:
+            raise ValueError("Seq2Seq requires window_size >= 77 and hidden_dim >= 1.")
         self.window_size = window_size
         self.output_size = window_size
         self.output_offset = 0

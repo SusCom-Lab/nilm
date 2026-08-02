@@ -205,8 +205,12 @@ class BERT4NILM(Seq2SeqCNN):
         appliance_output_size: int = 1,
     ):
         nn.Module.__init__(self)
-        if (window_size, hidden_dim, num_heads, num_layers, dropout, appliance_output_size) != (480, 256, 2, 2, 0.1, 1):
-            raise ValueError("BERT4NILM uses the fixed official default configuration.")
+        if window_size < 2 or window_size % 2:
+            raise ValueError("BERT4NILM window_size must be a positive even integer.")
+        if hidden_dim < 1 or num_heads < 1 or hidden_dim % num_heads:
+            raise ValueError("BERT4NILM hidden_dim must be divisible by num_heads.")
+        if num_layers < 1 or not 0.0 <= dropout < 1.0 or appliance_output_size < 1:
+            raise ValueError("BERT4NILM layer counts must be positive and dropout must be in [0, 1).")
         self.window_size = window_size
         self.output_size = window_size
         self.output_offset = 0

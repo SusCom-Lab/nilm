@@ -274,11 +274,12 @@ class NILMFormer(Seq2SeqCNN):
         if d_model % 4 != 0:
             raise ValueError("d_model must be divisible by 4.")
         nn.Module.__init__(self)
-        if (window_size, c_embedding, kernel_size, kernel_size_head, dilations, conv_bias,
-            n_encoder_layers, d_model, dp_rate, pffn_ratio, n_head, norm_eps) != (
-            256, 8, 3, 3, [1, 2, 4, 8], True, 3, 96, 0.2, 4, 8, 1e-5
-        ):
-            raise ValueError("NILMFormer uses the fixed official default configuration.")
+        if window_size < 2 or kernel_size < 1 or kernel_size_head < 1:
+            raise ValueError("NILMFormer window and kernel sizes must be positive.")
+        if n_encoder_layers < 1 or d_model < 1 or pffn_ratio < 1 or n_head < 1:
+            raise ValueError("NILMFormer layer dimensions must be positive.")
+        if d_model % n_head != 0 or not 0.0 <= dp_rate < 1.0 or norm_eps <= 0:
+            raise ValueError("Invalid NILMFormer attention, dropout, or normalization settings.")
         self.window_size = window_size
         self.output_size = window_size
         self.output_offset = 0

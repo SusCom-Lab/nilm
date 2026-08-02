@@ -1,4 +1,5 @@
 # main.py
+import json
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -163,6 +164,27 @@ def promptModelSelection():
     return numbered_models[model_num]
 
 
+def promptModelConfig(model_name: str):
+    """Return official defaults unless the user explicitly overrides them."""
+
+    entry = get_model_entry(model_name)
+    default_window = getattr(entry.cls, "default_window_size", None)
+    model_init_kwargs = {}
+    if default_window is not None:
+        model_init_kwargs["window_size"] = _safe_int_input(
+            "Input window size", int(default_window)
+        )
+    raw_kwargs = input(
+        "Additional model init kwargs as JSON, or press Enter for defaults: "
+    ).strip()
+    if raw_kwargs:
+        parsed = json.loads(raw_kwargs)
+        if not isinstance(parsed, dict):
+            raise ValueError("Model init kwargs must be a JSON object.")
+        model_init_kwargs.update(parsed)
+    return model_init_kwargs
+
+
 # ---------------------------------------------------------------------
 # CLI wrappers
 # ---------------------------------------------------------------------
@@ -171,6 +193,7 @@ def trainModelCLI():
     using_colab = runningColab()
 
     model_name = promptModelSelection()
+    model_init_kwargs = promptModelConfig(model_name)
     entry = get_model_entry(model_name)
     is_joint_classical = bool(getattr(entry.cls, "is_joint_classical", False))
 
@@ -195,7 +218,9 @@ def trainModelCLI():
 
     crop_value = input("Crop rows per CSV for quick runs (press enter for full data): ").strip()
     crop = int(crop_value) if crop_value else None
-    print(f"Using official model defaults and fixed seeds: {OFFICIAL_EXPERIMENT_SEEDS}")
+    default_epochs = int(getattr(entry.cls, "default_num_epochs", 10))
+    num_epochs = _safe_int_input("Number of epochs", default_epochs)
+    print(f"Using fixed seeds: {OFFICIAL_EXPERIMENT_SEEDS}")
     for seed in OFFICIAL_EXPERIMENT_SEEDS:
         trainer = train_model.Trainer(
             model_name=model_name,
@@ -206,8 +231,9 @@ def trainModelCLI():
             model_save_dir=model_save_dir,
             seed=seed,
             crop=crop,
+            model_init_kwargs=model_init_kwargs,
         )
-        trainer.trainModel()
+        trainer.trainModel(num_epochs)
         trainer.plotLosses()
     print("Model training completed.")
 

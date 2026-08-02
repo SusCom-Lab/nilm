@@ -45,10 +45,8 @@ class DiscriminativeSparseCoding:
         sparsity_coef: float = 20,
         n_components: int = 10,
     ):
-        if (window_size, learning_rate, iterations, sparsity_coef, n_components) != (
-            120, 1e-9, 3000, 20, 10
-        ):
-            raise ValueError("DSC uses the fixed official default configuration.")
+        if min(window_size, learning_rate, iterations, sparsity_coef, n_components) <= 0:
+            raise ValueError("DSC hyperparameters must be positive.")
         self.window_size = window_size
         self._config = {
             "window_size": window_size,
