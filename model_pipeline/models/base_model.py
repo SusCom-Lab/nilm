@@ -9,8 +9,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader
 
-from model_pipeline.contracts import FitResult
+from model_pipeline.contracts import FitResult, PredictionOutput
 
 
 class BaseNILMModel(ABC):
@@ -294,6 +295,59 @@ class TorchNILMModel(nn.Module, BaseNILMModel):
             best_score=best_score,
             history=history,
             checkpoint_path=checkpoint_path,
+        )
+
+    def predict(self, inference_data, context) -> PredictionOutput:
+        """Default aggregate-only inference for point and sequence baselines."""
+
+        from model_pipeline.data_feeder import reconstruct_series_from_windows
+        from model_pipeline.inference_data import InferenceWindowDataset
+
+        stats = context.normalisation_stats
+        if stats is None:
+            raise ValueError("Model inference requires training normalisation_stats.")
+        dataset = InferenceWindowDataset(
+            timestamps=inference_data.timestamps,
+            aggregate=inference_data.aggregate,
+            segment_ids=inference_data.segment_ids,
+            window_size=self.get_window_size(),
+            output_size=self.get_output_size(),
+            output_offset=self.get_output_offset(),
+            normalisation_stats=stats,
+            include_temporal_features=bool(
+                getattr(self, "requires_temporal_features", False)
+            ),
+        )
+        if len(dataset) == 0:
+            raise ValueError("Inference data does not contain a complete model window.")
+
+        loader = DataLoader(dataset, batch_size=context.batch_size, shuffle=False)
+        self.to(context.device)
+        self.eval()
+        windows = []
+        with torch.inference_mode():
+            for inputs in loader:
+                outputs = self.prepare_outputs(self(inputs.to(context.device)))
+                windows.append(outputs.detach().cpu().numpy())
+
+        window_predictions = np.concatenate(windows, axis=0)
+        window_predictions = (
+            window_predictions * float(stats["appliance_std"])
+            + float(stats["appliance_mean"])
+        )
+        power, coverage = reconstruct_series_from_windows(
+            window_predictions,
+            len(inference_data.timestamps),
+            target_mode=self.get_target_type(),
+            output_offset=self.get_output_offset(),
+            output_size=self.get_output_size(),
+            window_start_indices=dataset.window_start_indices,
+        )
+        return PredictionOutput(
+            timestamps=np.asarray(inference_data.timestamps),
+            power=power,
+            valid_mask=coverage > 0,
+            metadata={"coverage": coverage},
         )
 
     def export_state(self) -> Any:
