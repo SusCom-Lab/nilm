@@ -1,4 +1,8 @@
-"""Subtask-gated sequence-to-point network for NILM."""
+"""Subtask-gated sequence-to-point network for NILM.
+
+Official source: https://github.com/nilmtk/nilmtk-contrib/blob/14efd545e09d836e02159b23444350af92c6ee70/nilmtk_contrib/torch/sgn.py
+Local adaptation: repository normalization, registry, and plugin interfaces.
+"""
 
 from __future__ import annotations
 

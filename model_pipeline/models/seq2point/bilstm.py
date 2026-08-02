@@ -1,5 +1,8 @@
 """
 Point-output BiLSTM baseline for NILM.
+
+Reference source: https://github.com/nilmtk/nilmtk-contrib/blob/14efd545e09d836e02159b23444350af92c6ee70/nilmtk_contrib/torch/rnn.py
+Implementation status: local bidirectional recurrent adaptation.
 """
 
 from __future__ import annotations

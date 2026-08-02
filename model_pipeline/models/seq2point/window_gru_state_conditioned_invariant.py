@@ -1,6 +1,9 @@
 """
 State-conditioned invariant WindowGRU model.
 
+Base source: https://github.com/nilmtk/nilmtk-contrib/blob/14efd545e09d836e02159b23444350af92c6ee70/nilmtk_contrib/torch/WindowGRU.py
+Implementation status: local domain-invariant research adaptation.
+
 The original WindowGRU representation is split into state-related z_s and
 amplitude-related z_a features. The state head uses z_s, while the power head
 uses [z_s, z_a]. The optional house loss is applied to z_s within on/off groups.

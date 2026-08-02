@@ -1,5 +1,8 @@
 """Seq2Point with the minimal state-amplitude factorization adapter.
 
+Base source: https://github.com/nilmtk/nilmtk-contrib/blob/14efd545e09d836e02159b23444350af92c6ee70/nilmtk_contrib/torch/seq2point.py
+Implementation status: local state-amplitude research adaptation.
+
 The original Seq2Point CNN/flatten/hidden representation is inherited without
 change.  Only its final hidden-to-power layer is replaced by the shared
 state-amplitude adapter.  The objective contains power, state, and conditional

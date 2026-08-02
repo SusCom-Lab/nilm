@@ -1,6 +1,9 @@
 """
 House-invariant state-aware WindowGRU model.
 
+Base source: https://github.com/nilmtk/nilmtk-contrib/blob/14efd545e09d836e02159b23444350af92c6ee70/nilmtk_contrib/torch/WindowGRU.py
+Implementation status: local domain-invariant research adaptation.
+
 This keeps the original WindowGRU encoder path and adds a state head plus an
 optional adversarial house head. With house_loss_weight=0 it reduces to a
 state-aware WindowGRU.

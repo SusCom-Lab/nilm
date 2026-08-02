@@ -1,5 +1,8 @@
 """
 Reduced Seq2Point CNN variant for NILM.
+
+Base source: https://github.com/nilmtk/nilmtk-contrib/blob/14efd545e09d836e02159b23444350af92c6ee70/nilmtk_contrib/torch/seq2point.py
+Implementation status: local reduced-capacity adaptation, not an upstream model.
 """
 
 from __future__ import annotations

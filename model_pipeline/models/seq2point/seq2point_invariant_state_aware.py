@@ -1,5 +1,8 @@
 """
 House-invariant state-aware Seq2Point model.
+
+Base source: https://github.com/nilmtk/nilmtk-contrib/blob/14efd545e09d836e02159b23444350af92c6ee70/nilmtk_contrib/torch/seq2point.py
+Implementation status: local domain-invariant research adaptation.
 """
 
 from __future__ import annotations

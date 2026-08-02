@@ -1,5 +1,8 @@
 """
 BERT-inspired NILM model matching nilmtk-contrib architecture.
+
+Official source: https://github.com/nilmtk/nilmtk-contrib/blob/14efd545e09d836e02159b23444350af92c6ee70/nilmtk_contrib/torch/bert.py
+Local adaptation: repository registry and plugin interfaces.
 """
 
 from __future__ import annotations

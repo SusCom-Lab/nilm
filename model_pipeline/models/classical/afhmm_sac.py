@@ -1,5 +1,8 @@
 """
 AFHMM-SAC baseline adapted to joint multi-appliance disaggregation.
+
+Official source: https://github.com/nilmtk/nilmtk-contrib/blob/14efd545e09d836e02159b23444350af92c6ee70/nilmtk_contrib/disaggregate/afhmm_sac.py
+Local adaptation: joint-house repository plugin interface.
 """
 
 from __future__ import annotations
