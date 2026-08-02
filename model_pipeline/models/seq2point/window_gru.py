@@ -11,16 +11,27 @@ import torch
 import torch.nn as nn
 
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.seq2point.rnn import _BasePointRNN
+from model_pipeline.models.seq2point.rnn import RNNBaseline
 
 
 @register_model("window_gru", aliases=("WindowGRU",), display_name="WindowGRU")
-class WindowGRU(_BasePointRNN):
+class WindowGRU(RNNBaseline):
     display_name = "WindowGRU"
     model_family = "rnn"
 
-    def __init__(self, *, window_size: int = 599, **kwargs):
-        super().__init__(window_size=window_size, **kwargs)
+    default_window_size = 19
+    default_num_epochs = 10
+    official_batch_size = 512
+
+    def __init__(self, *, window_size: int = 19):
+        nn.Module.__init__(self)
+        if window_size != 19:
+            raise ValueError("WindowGRU uses the official window_size=19.")
+        self.window_size = window_size
+        self.output_size = 1
+        self.output_offset = window_size // 2
+        self._config = {"window_size": window_size}
+        self.normalization = None
         self.conv1 = nn.Conv1d(1, 16, kernel_size=4, padding=2)
         self.gru1 = nn.GRU(16, 64, batch_first=True, bidirectional=True)
         self.dropout1 = nn.Dropout(0.5)
@@ -42,4 +53,4 @@ class WindowGRU(_BasePointRNN):
         x = self.fc1(x)
         x = torch.relu(x)
         x = self.dropout3(x)
-        return self.fc2(x)
+        return self.fc2(x).reshape(-1)

@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.base_model import TorchNILMModel
+from model_pipeline.models.seq2point.rnn import RNNBaseline
 
 
 class AttentionLayer(nn.Module):
@@ -33,13 +33,24 @@ class AttentionLayer(nn.Module):
 
 
 @register_model("rnn_attention", aliases=("RNN_attention", "RNNAttention"), display_name="RNN_Attention")
-class RNNAttentionNILM(TorchNILMModel):
+class RNNAttentionNILM(RNNBaseline):
     display_name = "RNN_Attention"
     model_family = "rnn_attention"
     target_type = "point"
 
-    def __init__(self, *, window_size: int = 19, **kwargs):
-        super().__init__(window_size=window_size, **kwargs)
+    default_window_size = 19
+    default_num_epochs = 10
+    official_batch_size = 512
+
+    def __init__(self, *, window_size: int = 19):
+        nn.Module.__init__(self)
+        if window_size != 19:
+            raise ValueError("RNN-Attention uses the official window_size=19.")
+        self.window_size = window_size
+        self.output_size = 1
+        self.output_offset = window_size // 2
+        self._config = {"window_size": window_size}
+        self.normalization = None
         self.conv1d = nn.Conv1d(1, 16, kernel_size=4, stride=1, padding=2)
         self.lstm1 = nn.LSTM(16, 128, num_layers=1, batch_first=True, bidirectional=True)
         self.lstm2 = nn.LSTM(256, 256, num_layers=1, batch_first=True, bidirectional=True)
@@ -58,4 +69,4 @@ class RNNAttentionNILM(TorchNILMModel):
         x = self.attention(x)
         x = torch.tanh(self.fc1(x))
         x = self.dropout(x)
-        return self.fc2(x)
+        return self.fc2(x).reshape(-1)
