@@ -30,6 +30,20 @@ class HouseholdSplit:
 
 
 @dataclass(frozen=True)
+class SupervisedData:
+    """A labelled partition plus an optional compatibility DataLoader.
+
+    Source-faithful plugins may build their official Dataset directly from
+    ``household_split.csv_paths``.  Existing simple baselines can consume the
+    prepared ``loader`` while they migrate to private training recipes.
+    """
+
+    household_split: HouseholdSplit | None
+    loader: Any | None = None
+    normalisation_stats: dict[str, float] | None = None
+
+
+@dataclass(frozen=True)
 class InferenceData:
     """Information available to a model at test time.
 
@@ -110,5 +124,6 @@ __all__ = [
     "InferenceContext",
     "InferenceData",
     "PredictionOutput",
+    "SupervisedData",
     "TrainingContext",
 ]

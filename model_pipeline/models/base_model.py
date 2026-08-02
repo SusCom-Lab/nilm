@@ -7,6 +7,10 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+from model_pipeline.contracts import FitResult
 
 
 class BaseNILMModel(ABC):
@@ -153,6 +157,144 @@ class TorchNILMModel(nn.Module, BaseNILMModel):
         if not isinstance(inputs, torch.Tensor):
             inputs = torch.as_tensor(inputs, dtype=torch.float32)
         return self(inputs)
+
+    def _prepare_plugin_batch(self, batch, device: str):
+        hook = getattr(self, "prepare_batch", None)
+        if callable(hook):
+            return hook(batch, device=device)
+        if not isinstance(batch, (tuple, list)) or len(batch) != 2:
+            raise ValueError(
+                "Model batches must be (inputs, targets), unless prepare_batch is implemented."
+            )
+        inputs, targets = batch
+        return inputs.to(device), self.prepare_targets(targets.to(device))
+
+    def _plugin_loss(self, inputs, targets, criterion):
+        hook = getattr(self, "compute_loss", None)
+        if callable(hook):
+            result = hook(inputs, targets, criterion=criterion)
+            return result[0] if isinstance(result, tuple) else result
+        outputs = self.prepare_outputs(self(inputs))
+        return criterion(outputs, targets)
+
+    def _plugin_validation(self, loader, device: str, criterion):
+        if loader is None:
+            return None, None
+        self.eval()
+        validation_loss = 0.0
+        selection_loss = 0.0
+        selection_hook = getattr(self, "compute_selection_loss", None)
+        with torch.no_grad():
+            for batch in loader:
+                inputs, targets = self._prepare_plugin_batch(batch, device)
+                loss = self._plugin_loss(inputs, targets, criterion)
+                validation_loss += float(loss.item())
+                selected = (
+                    selection_hook(inputs, targets, criterion=criterion)
+                    if callable(selection_hook)
+                    else loss
+                )
+                selection_loss += float(selected.item())
+        count = max(1, len(loader))
+        return validation_loss / count, selection_loss / count
+
+    def fit(self, train_data, validation_data, context) -> FitResult:
+        """Default recipe for simple gradient-based baselines.
+
+        Models with a source-specific Dataset, mask, optimiser, scheduler, or
+        multi-stage objective override this method in their own model file.
+        """
+
+        train_loader = getattr(train_data, "loader", None)
+        validation_loader = getattr(validation_data, "loader", None)
+        if train_loader is None:
+            raise ValueError(f"{self.__class__.__name__} requires a training DataLoader.")
+
+        device = context.device
+        self.to(device)
+        config = dict(context.config)
+        criterion = config.get("criterion") or nn.MSELoss()
+        optimizer = config.get("optimizer") or optim.Adam(
+            self.parameters(), lr=0.001, betas=(0.9, 0.999)
+        )
+        scheduler = config.get("scheduler") or ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=2, threshold=1e-4
+        )
+        gradient_clip_norm = config.get("gradient_clip_norm")
+        select_epoch_zero = bool(config.get("select_epoch_zero", False))
+        history = []
+        best_epoch = None
+        best_score = None
+        checkpoint_path = None
+
+        def report(epoch, train_loss, validation_loss, selection_loss):
+            nonlocal best_epoch, best_score, checkpoint_path
+            record = {
+                "epoch": int(epoch),
+                "train_mse": train_loss,
+                "validation_mse": validation_loss,
+                "selection_loss": selection_loss,
+                "checkpoint_eligible": True,
+            }
+            history.append(record)
+            decision = context.checkpoint_callback(
+                model=self,
+                epoch=int(epoch),
+                train_loss=train_loss,
+                validation_loss=validation_loss,
+                selection_loss=selection_loss,
+                record=record,
+            ) or {}
+            if decision.get("saved"):
+                best_epoch = int(epoch)
+                best_score = float(selection_loss)
+                checkpoint_path = decision.get("checkpoint_path")
+            return bool(decision.get("should_stop", False))
+
+        if select_epoch_zero and validation_loader is not None:
+            validation_loss, selection_loss = self._plugin_validation(
+                validation_loader, device, criterion
+            )
+            report(0, None, validation_loss, selection_loss)
+
+        for epoch in range(1, int(context.num_epochs) + 1):
+            batch_sampler = getattr(train_loader, "batch_sampler", None)
+            set_epoch = getattr(batch_sampler, "set_epoch", None)
+            if callable(set_epoch):
+                set_epoch(epoch)
+
+            self.train()
+            total = 0.0
+            for batch in train_loader:
+                inputs, targets = self._prepare_plugin_batch(batch, device)
+                optimizer.zero_grad()
+                loss = self._plugin_loss(inputs, targets, criterion)
+                loss.backward()
+                if gradient_clip_norm is not None:
+                    nn.utils.clip_grad_norm_(
+                        [parameter for parameter in self.parameters() if parameter.requires_grad],
+                        float(gradient_clip_norm),
+                    )
+                optimizer.step()
+                total += float(loss.item())
+
+            train_loss = total / max(1, len(train_loader))
+            validation_loss, selection_loss = self._plugin_validation(
+                validation_loader, device, criterion
+            )
+            if validation_loss is None:
+                validation_loss = train_loss
+                selection_loss = train_loss
+            scheduler.step(selection_loss)
+            if report(epoch, train_loss, validation_loss, selection_loss):
+                break
+
+        return FitResult(
+            best_epoch=best_epoch,
+            best_score=best_score,
+            history=history,
+            checkpoint_path=checkpoint_path,
+        )
 
     def export_state(self) -> Any:
         return self.state_dict()
