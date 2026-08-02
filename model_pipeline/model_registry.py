@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module
+import pkgutil
 from typing import Any, Callable
 
 import torch
@@ -68,7 +69,12 @@ def discover_models() -> None:
     global _DISCOVERED
     if _DISCOVERED:
         return
-    import_module("model_pipeline.models")
+    package = import_module("model_pipeline.models")
+    for module in pkgutil.walk_packages(
+        package.__path__,
+        prefix=f"{package.__name__}.",
+    ):
+        import_module(module.name)
     _DISCOVERED = True
 
 
