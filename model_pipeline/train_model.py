@@ -119,6 +119,11 @@ def build_windowed_loaders(
         status_column=status_column,
         include_temporal_features=include_temporal_features,
     )
+    if len(train_dataset) == 0:
+        raise ValueError(
+            "The selected training households produced no valid windows. "
+            "Check the window size, crop, and appliance activity filters."
+        )
     normalisation_stats = train_dataset.get_normalisation_stats()
     validation_dataset = None
     if validation_csv_paths:
@@ -136,6 +141,11 @@ def build_windowed_loaders(
             status_column=status_column,
             include_temporal_features=include_temporal_features,
         )
+        if len(validation_dataset) == 0:
+            raise ValueError(
+                "The selected validation households produced no valid windows. "
+                "Checkpoint selection requires a non-empty validation set."
+            )
 
     generator = torch.Generator()
     generator.manual_seed(seed)
