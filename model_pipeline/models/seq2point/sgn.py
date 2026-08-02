@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.base_model import TorchNILMModel
+from model_pipeline.models.seq2point.seq2point import Seq2Point
 
 
 PAPER_KERNEL_SIZES = (10, 8, 6, 5, 5, 5)
@@ -65,12 +65,16 @@ class SGNTower(nn.Module):
     aliases=("SGN", "Subtask Gated Network"),
     display_name="SGN",
 )
-class SGN(TorchNILMModel):
+class SGN(Seq2Point):
     """Independent regression and classification towers joined by a soft gate."""
 
     display_name = "SGN"
     model_family = "seq2point"
     target_type = "point"
+    default_window_size = 299
+    default_num_epochs = 10
+    official_batch_size = 16
+    official_learning_rate = 1e-4
 
     def __init__(
         self,
@@ -80,7 +84,6 @@ class SGN(TorchNILMModel):
         dropout: float = 0.0,
         classification_weight: float = 1.0,
         on_power_threshold: float = PAPER_ON_POWER_THRESHOLD,
-        **kwargs,
     ):
         window_size = int(window_size)
         hidden_dim = int(hidden_dim)
@@ -101,14 +104,18 @@ class SGN(TorchNILMModel):
         if on_power_threshold < 0.0:
             raise ValueError("on_power_threshold must be non-negative.")
 
-        super().__init__(
-            window_size=window_size,
-            hidden_dim=hidden_dim,
-            dropout=dropout,
-            classification_weight=classification_weight,
-            on_power_threshold=on_power_threshold,
-            **kwargs,
-        )
+        nn.Module.__init__(self)
+        self.window_size = window_size
+        self.output_size = 1
+        self.output_offset = window_size // 2
+        self._config = {
+            "window_size": window_size,
+            "hidden_dim": hidden_dim,
+            "dropout": dropout,
+            "classification_weight": classification_weight,
+            "on_power_threshold": on_power_threshold,
+        }
+        self.normalization = None
         self.hidden_dim = hidden_dim
         self.dropout = dropout
         self.classification_weight = classification_weight

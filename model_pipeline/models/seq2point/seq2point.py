@@ -311,8 +311,8 @@ class Seq2Point(nn.Module):
                             windows[offset : offset + context.batch_size],
                             dtype=torch.float32,
                             device=context.device,
-                        ).unsqueeze(1)
-                        batches.append(self(inputs).cpu().numpy())
+                        )
+                        batches.append(self.prepare_outputs(self(inputs)).cpu().numpy())
                     normalized = np.concatenate(batches)
                     series_prediction[start:end] = (
                         normalized * stats["appliance_std"] + stats["appliance_mean"]
