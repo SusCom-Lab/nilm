@@ -14,6 +14,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 from model_pipeline.classical_data import load_grouped_classical_data
+from model_pipeline.data_protocol import build_train_validation_splits
 from model_pipeline.data_feeder import SlidingWindowDataset
 from model_pipeline.model_registry import create_model
 
@@ -83,7 +84,8 @@ def compute_metrics(predictions, ground_truth):
 
 
 def build_windowed_loaders(
-    csv_paths,
+    train_csv_paths,
+    validation_csv_paths=None,
     *,
     window_size,
     target_mode,
@@ -91,20 +93,20 @@ def build_windowed_loaders(
     output_offset,
     crop=None,
     batch_size=256,
-    val_ratio=0.2,
     seed=42,
     appliance_on_threshold=None,
     min_on_points=1,
     min_on_rate=0.0,
     status_column=None,
 ):
-    train_split_ratio = 1 - val_ratio
+    validation_csv_paths = list(validation_csv_paths or [])
+    if validation_csv_paths:
+        build_train_validation_splits(train_csv_paths, validation_csv_paths)
+
     train_dataset = SlidingWindowDataset(
-        csv_paths,
+        train_csv_paths,
         window_size,
         crop=crop,
-        split_ratio=train_split_ratio,
-        split_mode="train",
         target_mode=target_mode,
         output_size=output_size,
         output_offset=output_offset,
@@ -114,21 +116,21 @@ def build_windowed_loaders(
         status_column=status_column,
     )
     normalisation_stats = train_dataset.get_normalisation_stats()
-    validation_dataset = SlidingWindowDataset(
-        csv_paths,
-        window_size,
-        crop=crop,
-        split_ratio=train_split_ratio,
-        split_mode="val",
-        target_mode=target_mode,
-        output_size=output_size,
-        output_offset=output_offset,
-        normalisation_stats=normalisation_stats,
-        appliance_on_threshold=appliance_on_threshold,
-        min_on_points=min_on_points,
-        min_on_rate=min_on_rate,
-        status_column=status_column,
-    )
+    validation_dataset = None
+    if validation_csv_paths:
+        validation_dataset = SlidingWindowDataset(
+            validation_csv_paths,
+            window_size,
+            crop=crop,
+            target_mode=target_mode,
+            output_size=output_size,
+            output_offset=output_offset,
+            normalisation_stats=normalisation_stats,
+            appliance_on_threshold=appliance_on_threshold,
+            min_on_points=min_on_points,
+            min_on_rate=min_on_rate,
+            status_column=status_column,
+        )
 
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -140,12 +142,14 @@ def build_windowed_loaders(
         generator=generator,
         worker_init_fn=get_worker_init_fn(seed),
     )
-    validation_loader = DataLoader(
-        validation_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        worker_init_fn=get_worker_init_fn(seed),
-    )
+    validation_loader = None
+    if validation_dataset is not None:
+        validation_loader = DataLoader(
+            validation_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            worker_init_fn=get_worker_init_fn(seed),
+        )
     return train_loader, validation_loader, normalisation_stats
 
 
@@ -160,11 +164,11 @@ class Trainer:
         *,
         model_name=None,
         train_csv_dirs=None,
+        validation_csv_dirs=None,
         appliance=None,
         dataset=None,
         model_save_dir=None,
         window_length=599,
-        val_ratio=0.2,
         result_dir=None,
         seed=42,
         batch_size=256,
@@ -201,6 +205,7 @@ class Trainer:
         self.seed = seed
         self.crop = crop
         self.train_csv_dirs = train_csv_dirs
+        self.validation_csv_dirs = validation_csv_dirs
         self.joint_classical_data = None
         self.normalisation_stats = None if normalisation_stats is None else dict(normalisation_stats)
         appliance_on_threshold, min_on_rate = resolve_appliance_filter_settings(
@@ -222,13 +227,13 @@ class Trainer:
         ):
             train_loader, validation_loader, normalisation_stats = build_windowed_loaders(
                 train_csv_dirs,
+                validation_csv_dirs,
                 window_size=self.model.get_window_size(),
                 target_mode=self.model.get_target_type(),
                 output_size=self.model.get_output_size(),
                 output_offset=self.model.get_output_offset(),
                 crop=crop,
                 batch_size=batch_size,
-                val_ratio=val_ratio,
                 seed=seed,
                 appliance_on_threshold=appliance_on_threshold,
                 min_on_points=min_on_points,

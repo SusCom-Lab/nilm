@@ -14,8 +14,6 @@ class SlidingWindowDataset(Dataset):
         file_dirs,
         window_size,
         crop=None,
-        split_ratio=None,
-        split_mode=None,
         target_mode="point",
         output_size=None,
         output_offset=None,
@@ -39,22 +37,21 @@ class SlidingWindowDataset(Dataset):
         self.normalisation_stats = None if normalisation_stats is None else dict(normalisation_stats)
         self.window_locations = []
 
-        split_dfs = []
+        source_dfs = []
         for file in file_dirs:
             print(f"Loading data: {os.path.basename(file)} ...")
             df = pd.read_csv(file)
             print(f"  Loaded {len(df)} rows.")
             if crop:
                 df = df.head(crop)
-            split_df = self._select_split(df, split_ratio, split_mode)
-            split_dfs.append((file, split_df.reset_index(drop=True)))
+            source_dfs.append((file, df.reset_index(drop=True)))
 
         if self.normalisation_stats is None:
             self.normalisation_stats = self._compute_normalisation_stats(
-                [df for _, df in split_dfs if not df.empty]
+                [df for _, df in source_dfs if not df.empty]
             )
 
-        for file, df in split_dfs:
+        for file, df in source_dfs:
             print(f"  Normalising {len(df)} rows.")
             normalised_df = df.copy()
             aggregate_column = normalised_df.columns[1]

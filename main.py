@@ -202,6 +202,11 @@ def trainModelCLI():
         print("File selection aborted. Exiting.")
         return
 
+    validation_csv_dirs = selectCSVFiles("validation", using_colab)
+    if not validation_csv_dirs:
+        print("Validation file selection aborted. Exiting.")
+        return
+
     appliance = input("Enter the appliance name: ")
     dataset = input("Enter the dataset name: ")
 
@@ -209,7 +214,6 @@ def trainModelCLI():
     os.makedirs(model_save_dir, exist_ok=True)
 
     num_epochs = _safe_int_input("Number of epochs", 10)
-    val_ratio = _safe_float_input("Validation ratio", 0.2)
     crop_value = input("Crop rows per CSV for quick runs (press enter for full data): ").strip()
     crop = int(crop_value) if crop_value else None
     seed = _safe_int_input("Random seed", 42)
@@ -217,11 +221,11 @@ def trainModelCLI():
     trainer = train_model.Trainer(
         model_name=model_name,
         train_csv_dirs=train_csv_dirs,
+        validation_csv_dirs=validation_csv_dirs,
         appliance=appliance,
         dataset=dataset,
         model_save_dir=model_save_dir,
         window_length=input_window_length,
-        val_ratio=val_ratio,
         seed=seed,
         crop=crop,
         model_init_kwargs=model_init_kwargs,

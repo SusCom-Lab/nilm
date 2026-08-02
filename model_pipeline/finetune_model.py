@@ -29,12 +29,12 @@ class Finetuner:
 
         train_loader, _, _ = build_windowed_loaders(
             [finetune_csv_dir],
+            None,
             window_size=self.model.get_window_size(),
             target_mode=self.model.get_target_type(),
             output_size=self.model.get_output_size(),
             output_offset=self.model.get_output_offset(),
             batch_size=1000,
-            val_ratio=0.0,
             seed=seed,
         )
 
