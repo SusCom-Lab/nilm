@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.base_model import TorchNILMModel
+from model_pipeline.models.seq2point.seq2point import Seq2Point
 
 
 @register_model(
@@ -19,13 +19,21 @@ from model_pipeline.models.base_model import TorchNILMModel
     aliases=("LSTM-Based Seq2Point", "seq2point_lstm"),
     display_name="Seq2Point_LSTM",
 )
-class LegacyLSTMSeq2Point(TorchNILMModel):
+class LegacyLSTMSeq2Point(Seq2Point):
     display_name = "Seq2Point_LSTM"
     model_family = "seq2point"
     target_type = "point"
 
-    def __init__(self, *, window_size: int = 180, hidden_dim: int = 128, **kwargs):
-        super().__init__(window_size=window_size, hidden_dim=hidden_dim, **kwargs)
+    default_window_size = 180
+    default_num_epochs = 10
+
+    def __init__(self, *, window_size: int = 180, hidden_dim: int = 128):
+        nn.Module.__init__(self)
+        self.window_size = window_size
+        self.output_size = 1
+        self.output_offset = window_size // 2
+        self._config = {"window_size": window_size, "hidden_dim": hidden_dim}
+        self.normalization = None
         self.pad = nn.ConstantPad1d((1, 2), 0.0)
         self.conv = nn.Conv1d(1, 16, kernel_size=4)
         self.lstm1 = nn.LSTM(input_size=16, hidden_size=64, batch_first=True, bidirectional=True)
@@ -44,4 +52,4 @@ class LegacyLSTMSeq2Point(TorchNILMModel):
         x, _ = self.lstm1(x)
         x, _ = self.lstm2(x)
         x = x.reshape(x.size(0), -1)
-        return self.head(x)
+        return self.head(x).reshape(-1)

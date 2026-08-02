@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.base_model import TorchNILMModel
+from model_pipeline.models.seq2point.seq2point import Seq2Point
 
 
 @register_model(
@@ -19,13 +19,21 @@ from model_pipeline.models.base_model import TorchNILMModel
     aliases=("Dropout-Reduced Seq2Point", "seq2point_reduced"),
     display_name="Seq2Point_Reduced",
 )
-class ReducedSeq2Point(TorchNILMModel):
+class ReducedSeq2Point(Seq2Point):
     display_name = "Seq2Point_Reduced"
     model_family = "seq2point"
     target_type = "point"
 
-    def __init__(self, *, window_size: int = 599, hidden_dim: int = 512, dropout: float = 0.5, **kwargs):
-        super().__init__(window_size=window_size, hidden_dim=hidden_dim, dropout=dropout, **kwargs)
+    default_window_size = 599
+    default_num_epochs = 10
+
+    def __init__(self, *, window_size: int = 599, hidden_dim: int = 512, dropout: float = 0.5):
+        nn.Module.__init__(self)
+        self.window_size = window_size
+        self.output_size = 1
+        self.output_offset = window_size // 2
+        self._config = {"window_size": window_size, "hidden_dim": hidden_dim, "dropout": dropout}
+        self.normalization = None
         self.features = nn.Sequential(
             nn.Conv1d(1, 20, kernel_size=8, padding="same"),
             nn.ReLU(),
@@ -54,4 +62,4 @@ class ReducedSeq2Point(TorchNILMModel):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.unsqueeze(1)
         x = self.features(x)
-        return self.head(x)
+        return self.head(x).reshape(-1)
