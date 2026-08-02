@@ -100,6 +100,7 @@ def build_windowed_loaders(
     min_on_points=1,
     min_on_rate=0.0,
     status_column=None,
+    include_temporal_features=False,
 ):
     validation_csv_paths = list(validation_csv_paths or [])
     if validation_csv_paths:
@@ -116,6 +117,7 @@ def build_windowed_loaders(
         min_on_points=min_on_points,
         min_on_rate=min_on_rate,
         status_column=status_column,
+        include_temporal_features=include_temporal_features,
     )
     normalisation_stats = train_dataset.get_normalisation_stats()
     validation_dataset = None
@@ -132,6 +134,7 @@ def build_windowed_loaders(
             min_on_points=min_on_points,
             min_on_rate=min_on_rate,
             status_column=status_column,
+            include_temporal_features=include_temporal_features,
         )
 
     generator = torch.Generator()
@@ -248,6 +251,9 @@ class Trainer:
                 min_on_rate=min_on_rate,
                 status_column=(
                     "status" if getattr(self.model, "requires_status_targets", False) else None
+                ),
+                include_temporal_features=bool(
+                    getattr(self.model, "requires_temporal_features", False)
                 ),
             )
             self.normalisation_stats = normalisation_stats

@@ -22,6 +22,7 @@ class SlidingWindowDataset(Dataset):
         min_on_points=1,
         min_on_rate=0.0,
         status_column=None,
+        include_temporal_features=False,
     ):
         self.window_size = int(window_size)
         self.target_mode = target_mode
@@ -32,6 +33,7 @@ class SlidingWindowDataset(Dataset):
         self.min_on_points = int(min_on_points)
         self.min_on_rate = float(min_on_rate)
         self.status_column = status_column
+        self.include_temporal_features = bool(include_temporal_features)
         self.data = []
         self.normalisation_params = {}
         self.normalisation_stats = None if normalisation_stats is None else dict(normalisation_stats)
@@ -87,6 +89,12 @@ class SlidingWindowDataset(Dataset):
 
                 inputs = torch.tensor(segment_df.iloc[:, 1].to_numpy(), dtype=torch.float32)
                 outputs = torch.tensor(segment_df.iloc[:, 2].to_numpy(), dtype=torch.float32)
+                temporal_features = None
+                if self.include_temporal_features:
+                    temporal_features = self._build_temporal_features(
+                        segment_df.iloc[:, 0],
+                        source=file,
+                    )
                 status_outputs = None
                 if status_column is not None:
                     status_outputs = torch.tensor(segment_df[status_column].to_numpy(), dtype=torch.float32)
@@ -94,53 +102,46 @@ class SlidingWindowDataset(Dataset):
                 if len(window_starts) == 0:
                     continue
 
-                self.data.append((inputs, outputs, status_outputs, segment_indices, window_starts))
-                self.window_locations.extend(int(segment_indices[start_idx]) for start_idx in window_starts)
-
-    def _select_split(self, df, split_ratio, split_mode):
-        if split_ratio is None or split_mode is None:
-            return df.copy()
-
-        if "segment_id" in df.columns:
-            segment_sizes = (
-                df.groupby("segment_id", sort=False)
-                .size()
-                .reset_index(name="rows")
-            )
-            target_rows = len(df) * split_ratio
-            cumulative_rows = segment_sizes["rows"].cumsum()
-            split_index = int((cumulative_rows < target_rows).sum())
-            if split_index < len(segment_sizes):
-                current_gap = abs(cumulative_rows.iloc[split_index] - target_rows)
-                previous_gap = abs(
-                    (cumulative_rows.iloc[split_index - 1] if split_index > 0 else 0) - target_rows
+                self.data.append(
+                    (
+                        inputs,
+                        outputs,
+                        status_outputs,
+                        segment_indices,
+                        window_starts,
+                        temporal_features,
+                    )
                 )
-                if previous_gap < current_gap:
-                    split_index -= 1
-
-            split_index = max(0, min(len(segment_sizes), split_index + 1))
-            segment_ids = segment_sizes["segment_id"]
-            if split_mode == "train":
-                selected_segments = segment_ids.iloc[:split_index]
-            elif split_mode == "val":
-                selected_segments = segment_ids.iloc[split_index:]
-            else:
-                return df.copy()
-            return df[df["segment_id"].isin(selected_segments)].copy()
-
-        total_rows = len(df)
-        split_index = int(total_rows * split_ratio)
-        if split_mode == "train":
-            return df.iloc[:split_index].copy()
-        if split_mode == "val":
-            return df.iloc[split_index:].copy()
-        return df.copy()
+                self.window_locations.extend(int(segment_indices[start_idx]) for start_idx in window_starts)
 
     def _safe_std(self, value):
         value = float(value)
         if not np.isfinite(value) or value == 0.0:
             return 1.0
         return value
+
+    @staticmethod
+    def _build_temporal_features(timestamp_values, *, source):
+        """Encode real timestamps in the official minute/hour/day/month order."""
+        timestamps = pd.to_datetime(timestamp_values, errors="coerce")
+        if timestamps.isna().any():
+            invalid_count = int(timestamps.isna().sum())
+            raise ValueError(
+                f"NILMFormer requires valid timestamps in the first CSV column; "
+                f"found {invalid_count} invalid value(s) in {source}."
+            )
+
+        periodic_values = (
+            (timestamps.dt.minute.to_numpy(dtype=np.float32), 60.0),
+            (timestamps.dt.hour.to_numpy(dtype=np.float32), 24.0),
+            (timestamps.dt.dayofweek.to_numpy(dtype=np.float32), 7.0),
+            (timestamps.dt.month.to_numpy(dtype=np.float32), 12.0),
+        )
+        channels = []
+        for values, period in periodic_values:
+            phase = 2.0 * np.pi * values / period
+            channels.extend((np.sin(phase), np.cos(phase)))
+        return torch.from_numpy(np.stack(channels).astype(np.float32, copy=False))
 
     def _compute_normalisation_stats(self, dfs):
         if not dfs:
@@ -200,7 +201,7 @@ class SlidingWindowDataset(Dataset):
         return list(self.window_locations)
 
     def __getitem__(self, idx):
-        for inputs, outputs, status_outputs, _, window_starts in self.data:
+        for inputs, outputs, status_outputs, _, window_starts, temporal_features in self.data:
             num_windows = len(window_starts)
             if idx < num_windows:
                 start_idx = window_starts[idx]
@@ -212,7 +213,16 @@ class SlidingWindowDataset(Dataset):
                         target = torch.stack((target.reshape(()), status_target.reshape(())))
                     else:
                         target = torch.stack((target, status_target), dim=-1)
-                return inputs[start_idx:end_idx], target
+                input_window = inputs[start_idx:end_idx]
+                if temporal_features is not None:
+                    input_window = torch.cat(
+                        (
+                            input_window.unsqueeze(0),
+                            temporal_features[:, start_idx:end_idx],
+                        ),
+                        dim=0,
+                    )
+                return input_window, target
             idx -= num_windows
 
         raise IndexError("Index out of range")
