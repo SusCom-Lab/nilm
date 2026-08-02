@@ -67,7 +67,7 @@ class Seq2PointDataset(Dataset):
                         torch.as_tensor(
                             (window - mains_mean) / mains_std,
                             dtype=torch.float32,
-                        ).unsqueeze(0)
+                        )
                     )
                     target = (
                         series.appliance_power[start + index, 0] - appliance_mean
@@ -143,6 +143,8 @@ class Seq2Point(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if inputs.ndim == 2:
+            inputs = inputs.unsqueeze(1)
         return self.network(inputs).reshape(-1)
 
     def encode(self, inputs: torch.Tensor) -> torch.Tensor:
