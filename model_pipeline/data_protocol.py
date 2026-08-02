@@ -22,6 +22,15 @@ from model_pipeline.api import (
 HOUSEHOLD_PATTERN = re.compile(r"(?:^|_)H(?P<house>\d+)(?:_|\.|$)", re.IGNORECASE)
 
 
+def same_csv_dataset(left_paths: Iterable[str], right_paths: Iterable[str]) -> bool:
+    """Return whether two selections contain exactly the same CSV files."""
+
+    normalise = lambda paths: sorted(
+        os.path.realpath(os.path.abspath(os.fspath(path))) for path in paths
+    )
+    return normalise(left_paths) == normalise(right_paths)
+
+
 def household_id_from_path(csv_path: str) -> str:
     """Return the canonical ``H<number>`` identifier encoded in a CSV name."""
 
@@ -184,6 +193,49 @@ def load_supervised_partition(
     )
 
 
+def split_supervised_partition(
+    partition: SupervisedPartition,
+    *,
+    train_ratio: float = 0.8,
+) -> tuple[SupervisedPartition, SupervisedPartition]:
+    """Chronologically split every series into train and validation portions."""
+
+    if not 0.0 < train_ratio < 1.0:
+        raise ValueError("train_ratio must be between 0 and 1.")
+
+    train_series = []
+    validation_series = []
+    for series in partition.series:
+        if len(series.timestamps) < 2:
+            raise ValueError("An 8:2 split requires at least two samples per series.")
+        split_index = min(
+            len(series.timestamps) - 1,
+            max(1, int(len(series.timestamps) * train_ratio)),
+        )
+
+        def sliced(start: int, end: int) -> SupervisedSeries:
+            return SupervisedSeries(
+                timestamps=series.timestamps[start:end],
+                aggregate=series.aggregate[start:end],
+                appliance_power=series.appliance_power[start:end],
+                appliances=series.appliances,
+                household_id=series.household_id,
+                segment_ids=(
+                    None if series.segment_ids is None else series.segment_ids[start:end]
+                ),
+                status=None if series.status is None else series.status[start:end],
+            )
+
+        train_series.append(sliced(0, split_index))
+        validation_series.append(sliced(split_index, len(series.timestamps)))
+
+    household_ids = tuple(series.household_id for series in partition.series)
+    return (
+        SupervisedPartition("training", household_ids, tuple(train_series)),
+        SupervisedPartition("validation", household_ids, tuple(validation_series)),
+    )
+
+
 def hide_partition_targets(partition: SupervisedPartition) -> InferencePartition:
     return InferencePartition(
         name=partition.name,
@@ -250,6 +302,8 @@ __all__ = [
     "hide_partition_targets",
     "load_supervised_partition",
     "make_household_split",
+    "same_csv_dataset",
+    "split_supervised_partition",
     "validate_disjoint_households",
     "validate_experiment_partitions",
 ]

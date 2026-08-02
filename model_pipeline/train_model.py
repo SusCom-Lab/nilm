@@ -21,6 +21,8 @@ from model_pipeline.data_protocol import (
     build_evaluation_target,
     hide_partition_targets,
     load_supervised_partition,
+    same_csv_dataset,
+    split_supervised_partition,
     validate_experiment_partitions,
 )
 from model_pipeline.model_registry import create_model, load_checkpoint
@@ -105,11 +107,24 @@ class Trainer:
         os.makedirs(self.model_save_dir, exist_ok=True)
         os.makedirs(self.result_dir, exist_ok=True)
 
-        self.train_data = load_supervised_partition("training", train_csv_dirs, crop=crop)
-        self.validation_supervised = load_supervised_partition(
-            "validation", validation_csv_dirs, crop=crop
+        self.shared_dataset_split = same_csv_dataset(
+            train_csv_dirs, validation_csv_dirs
         )
-        validate_experiment_partitions(self.train_data, self.validation_supervised)
+        if self.shared_dataset_split:
+            complete_data = load_supervised_partition(
+                "training_validation", train_csv_dirs, crop=crop
+            )
+            self.train_data, self.validation_supervised = split_supervised_partition(
+                complete_data, train_ratio=0.8
+            )
+        else:
+            self.train_data = load_supervised_partition(
+                "training", train_csv_dirs, crop=crop
+            )
+            self.validation_supervised = load_supervised_partition(
+                "validation", validation_csv_dirs, crop=crop
+            )
+            validate_experiment_partitions(self.train_data, self.validation_supervised)
         self.validation_input = hide_partition_targets(self.validation_supervised)
         self.validation_target = build_evaluation_target(self.validation_supervised)
         self.validation_aggregate = np.concatenate(
@@ -131,6 +146,9 @@ class Trainer:
             "seed": self.seed,
             "train_households": list(self.train_data.household_ids),
             "validation_households": list(self.validation_supervised.household_ids),
+            "split_strategy": (
+                "chronological_80_20" if self.shared_dataset_split else "disjoint_households"
+            ),
             "model_config": dict(getattr(self.model, "_config", self.model_init_kwargs)),
             "num_epochs": self.num_epochs,
         }
