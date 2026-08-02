@@ -4,7 +4,6 @@ import model_pipeline.models.seq2point.seq2point_reduced as seq2point_reduced  #
 import model_pipeline.models.seq2point.rnn as rnn  # noqa: F401
 import model_pipeline.models.seq2point.rnn_attention as rnn_attention  # noqa: F401
 import model_pipeline.models.seq2point.seq2point as seq2point  # noqa: F401
-import model_pipeline.models.seq2point.seq2point_state_amplitude_factorized as seq2point_state_amplitude_factorized  # noqa: F401
 import model_pipeline.models.seq2point.seq2point_state_conditioned_invariant as seq2point_state_conditioned_invariant  # noqa: F401
 import model_pipeline.models.seq2point.seq2point_invariant_state_aware as seq2point_invariant_state_aware  # noqa: F401
 import model_pipeline.models.seq2point.seq2point_lstm as seq2point_lstm  # noqa: F401
@@ -21,7 +20,6 @@ __all__ = [
     "rnn",
     "rnn_attention",
     "seq2point",
-    "seq2point_state_amplitude_factorized",
     "seq2point_state_conditioned_invariant",
     "seq2point_invariant_state_aware",
     "seq2point_lstm",
