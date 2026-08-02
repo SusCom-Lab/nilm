@@ -16,13 +16,54 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 
-from model_pipeline.contracts import FitResult
+from model_pipeline.api import FitResult, TrainingContext
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.base_model import TorchNILMModel
+from model_pipeline.models.seq2seq.seq2seq import Seq2SeqCNN
+
+
+class BERT4NILMDataset(Dataset):
+    """Centered official windows with aligned power/status supervision."""
+
+    def __init__(self, partition, window_size, stats):
+        self.inputs = []
+        self.targets = []
+        half = window_size // 2
+        for series in partition.series:
+            if len(series.appliances) != 1 or series.status is None:
+                raise ValueError("BERT4NILM requires one appliance and a status column.")
+            segments = series.segment_ids
+            if segments is None:
+                segments = np.zeros(len(series.aggregate), dtype=np.int64)
+            start = 0
+            while start < len(series.aggregate):
+                end = start + 1
+                while end < len(series.aggregate) and segments[end] == segments[start]:
+                    end += 1
+                mains = np.pad(series.aggregate[start:end], (half, half))
+                power = np.pad(series.appliance_power[start:end, 0], (half, half))
+                status = np.pad(series.status[start:end, 0], (half, half))
+                for index in range(end - start):
+                    self.inputs.append(torch.as_tensor(
+                        (mains[index:index + window_size] - stats["mains_mean"])
+                        / stats["mains_std"], dtype=torch.float32
+                    ))
+                    normalized_power = (
+                        power[index:index + window_size] - stats["appliance_mean"]
+                    ) / stats["appliance_std"]
+                    self.targets.append(torch.as_tensor(
+                        np.stack((normalized_power, status[index:index + window_size]), axis=-1),
+                        dtype=torch.float32,
+                    ))
+                start = end
+
+    def __len__(self): return len(self.inputs)
+    def __getitem__(self, index): return self.inputs[index], self.targets[index]
 
 
 class GELU(nn.Module):
@@ -141,13 +182,17 @@ class TransformerBlock(nn.Module):
     aliases=("BERT4NILM", "bert_4_nilm"),
     display_name="BERT4NILM",
 )
-class BERT4NILM(TorchNILMModel):
+class BERT4NILM(Seq2SeqCNN):
     display_name = "BERT4NILM"
     model_family = "transformer"
     target_type = "sequence"
     default_window_size = 480
     default_output_size = None
     requires_status_targets = True
+    default_num_epochs = 100
+    official_batch_size = 128
+    official_mains_mean = 0.0
+    official_mains_std = 1.0
 
     def __init__(
         self,
@@ -158,17 +203,22 @@ class BERT4NILM(TorchNILMModel):
         num_layers: int = 2,
         dropout: float = 0.1,
         appliance_output_size: int = 1,
-        **kwargs,
     ):
-        super().__init__(
-            window_size=window_size,
-            hidden_dim=hidden_dim,
-            num_heads=num_heads,
-            num_layers=num_layers,
-            dropout=dropout,
-            appliance_output_size=appliance_output_size,
-            **kwargs,
-        )
+        nn.Module.__init__(self)
+        if (window_size, hidden_dim, num_heads, num_layers, dropout, appliance_output_size) != (480, 256, 2, 2, 0.1, 1):
+            raise ValueError("BERT4NILM uses the fixed official default configuration.")
+        self.window_size = window_size
+        self.output_size = window_size
+        self.output_offset = 0
+        self._config = {
+            "window_size": window_size, "hidden_dim": hidden_dim,
+            "num_heads": num_heads, "num_layers": num_layers,
+            "dropout": dropout, "appliance_output_size": appliance_output_size,
+            "learning_rate": 1e-4, "weight_decay": 0.0,
+            "mask_probability": 0.25, "temperature": 0.1,
+            "on_power_threshold": 15.0, "c0": 1.0,
+        }
+        self.normalization = None
         self.hidden = int(hidden_dim)
         self.heads = int(num_heads)
         self.n_layers = int(num_layers)
@@ -298,26 +348,18 @@ class BERT4NILM(TorchNILMModel):
             )
         return total_loss
 
-    def _validation_mse(self, loader, device):
-        if loader is None:
-            return None
-        self.eval()
-        total = 0.0
-        with torch.no_grad():
-            for inputs, targets in loader:
-                inputs = inputs.to(device)
-                power_targets, _ = self._split_supervised_targets(targets.to(device))
-                total += float(F.mse_loss(self(inputs), power_targets).item())
-        return total / max(1, len(loader))
-
-    def fit(self, train_data, validation_data, context) -> FitResult:
+    def fit(self, train_data, validation_data, context: TrainingContext) -> FitResult:
         """Run the official mask/corruption and composite-loss training recipe."""
 
-        train_loader = train_data.loader
-        validation_loader = validation_data.loader
-        stats = train_data.normalisation_stats
-        if train_loader is None or stats is None:
-            raise ValueError("BERT4NILM requires a training loader and training statistics.")
+        del validation_data
+        self._set_normalization(train_data)
+        stats = self.normalization
+        train_loader = DataLoader(
+            BERT4NILMDataset(train_data, self.window_size, stats),
+            batch_size=self.official_batch_size,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(context.seed),
+        )
 
         self.to(context.device)
         no_decay = ("bias", "layer_norm")
@@ -362,39 +404,23 @@ class BERT4NILM(TorchNILMModel):
                 total += float(loss.item())
 
             train_loss = total / max(1, len(train_loader))
-            validation_loss = self._validation_mse(validation_loader, context.device)
-            if validation_loss is None:
-                validation_loss = train_loss
+            validation = context.validate_candidate(epoch=epoch, model=self)
             record = {
                 "epoch": epoch,
-                "train_loss": train_loss,
-                "validation_mse": validation_loss,
-                "selection_loss": validation_loss,
-                "checkpoint_eligible": True,
+                "training_loss": train_loss,
+                "validation_mse": validation.mse,
             }
             history.append(record)
-            print(
-                f"Epoch {epoch}/{context.num_epochs}, Train Loss: {train_loss}, "
-                f"Val Loss: {validation_loss}, Selection Loss: {validation_loss}"
-            )
-            decision = context.checkpoint_callback(
-                model=self,
-                epoch=epoch,
-                train_loss=train_loss,
-                validation_loss=validation_loss,
-                selection_loss=validation_loss,
-                record=record,
-            ) or {}
-            if decision.get("saved"):
+            if validation.improved:
                 best_epoch = epoch
-                best_score = validation_loss
-                checkpoint_path = decision.get("checkpoint_path")
-            if decision.get("should_stop"):
+                best_score = validation.mse
+                checkpoint_path = validation.checkpoint_path
+            if validation.should_stop:
                 break
 
         return FitResult(
-            best_epoch=best_epoch,
-            best_score=best_score,
             history=history,
+            best_epoch=best_epoch,
+            best_validation_mse=best_score,
             checkpoint_path=checkpoint_path,
         )
