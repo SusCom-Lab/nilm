@@ -109,6 +109,7 @@ class Seq2Point(nn.Module):
     default_window_size = 99
     default_num_epochs = 10
     official_batch_size = 512
+    official_learning_rate = 0.001
     official_mains_mean = 1800.0
     official_mains_std = 600.0
 
@@ -223,7 +224,9 @@ class Seq2Point(nn.Module):
             generator=generator,
         )
         self.to(context.device)
-        optimizer = torch.optim.Adam(self.parameters())
+        optimizer = torch.optim.Adam(
+            self.parameters(), lr=float(self.official_learning_rate)
+        )
         criterion = nn.MSELoss()
         history: list[dict[str, Any]] = []
         best_epoch = None
