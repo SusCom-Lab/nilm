@@ -3,12 +3,12 @@
 The network architecture is derived from the official Apache-2.0 implementation:
 https://github.com/adrienpetralia/NILMFormer
 
-Training recipe reference:
-https://github.com/nilmtk/nilmtk-contrib/blob/14efd545e09d836e02159b23444350af92c6ee70/nilmtk_contrib/torch/nilmformer.py
+Reference revision:
+e73a975a42fbebed6f9d7e90d75f7f48ae02fed9
 
 Copyright © 2025 EDF
-Local integration changes: registry metadata, input validation, and removal of the
-singleton output channel so the model returns ``[batch, sequence_length]``.
+Local integration changes: canonical partitions, public validation/checkpoints,
+full-timeline output, and removal of the singleton output channel.
 """
 
 from __future__ import annotations
@@ -35,8 +35,8 @@ def _calendar_features(timestamps) -> np.ndarray:
     periodic = (
         (values.dt.minute.to_numpy(dtype=np.float32), 60.0),
         (values.dt.hour.to_numpy(dtype=np.float32), 24.0),
-        (values.dt.dayofweek.to_numpy(dtype=np.float32), 7.0),
-        (values.dt.month.to_numpy(dtype=np.float32), 12.0),
+        (values.dt.dayofweek.to_numpy(dtype=np.float32) - 1.0, 7.0),
+        (values.dt.month.to_numpy(dtype=np.float32) - 1.0, 12.0),
     )
     channels = []
     for raw, period in periodic:
@@ -45,11 +45,24 @@ def _calendar_features(timestamps) -> np.ndarray:
     return np.stack(channels).astype(np.float32, copy=False)
 
 
+def _extend_timestamps(timestamps, length: int) -> np.ndarray:
+    values = pd.DatetimeIndex(pd.to_datetime(np.asarray(timestamps)))
+    if len(values) >= length:
+        return values[:length].to_numpy()
+    if len(values) > 1:
+        deltas = np.diff(values.view("int64"))
+        positive = deltas[deltas > 0]
+        step_ns = int(np.median(positive)) if len(positive) else 60_000_000_000
+    else:
+        step_ns = 60_000_000_000
+    extra = values[-1].value + step_ns * np.arange(1, length - len(values) + 1)
+    return np.concatenate((values.to_numpy(), extra.astype("datetime64[ns]")))
+
+
 class NILMFormerDataset(Dataset):
     def __init__(self, partition, window_size, stats):
         self.inputs = []
         self.targets = []
-        half = window_size // 2
         for series in partition.series:
             if len(series.appliances) != 1:
                 raise ValueError("NILMFormer is configured for one appliance.")
@@ -61,25 +74,24 @@ class NILMFormerDataset(Dataset):
                 end = start + 1
                 while end < len(series.aggregate) and segments[end] == segments[start]:
                     end += 1
-                mains = np.pad(series.aggregate[start:end], (half, half))
-                calendar = np.pad(
-                    _calendar_features(series.timestamps[start:end]),
-                    ((0, 0), (half, half)), mode="edge",
-                )
-                target = np.pad(series.appliance_power[start:end, 0], (half, half))
-                for index in range(end - start):
-                    power_window = (
-                        mains[index:index + window_size] - stats["mains_mean"]
-                    ) / stats["mains_std"]
+                mains = series.aggregate[start:end]
+                calendar = _calendar_features(series.timestamps[start:end])
+                target = series.appliance_power[start:end, 0]
+                for index in range(0, len(mains) - window_size + 1, window_size):
+                    power_window = mains[index:index + window_size] / stats["power_scale"]
                     self.inputs.append(torch.as_tensor(
                         np.concatenate((power_window[None, :], calendar[:, index:index + window_size])),
                         dtype=torch.float32,
                     ))
                     self.targets.append(torch.as_tensor(
-                        (target[index:index + window_size] - stats["appliance_mean"])
-                        / stats["appliance_std"], dtype=torch.float32
+                        target[index:index + window_size] / stats["power_scale"],
+                        dtype=torch.float32,
                     ))
                 start = end
+        if not self.inputs:
+            raise ValueError(
+                f"NILMFormer training requires at least one complete {window_size}-sample window."
+            )
 
     def __len__(self): return len(self.inputs)
     def __getitem__(self, index): return self.inputs[index], self.targets[index]
@@ -247,8 +259,8 @@ class NILMFormer(Seq2SeqCNN):
     default_window_size = 256
     default_output_size = None
     requires_temporal_features = True
-    default_num_epochs = 50
-    official_batch_size = 128
+    default_num_epochs = 3
+    official_batch_size = 64
     official_mains_mean = 0.0
     official_mains_std = 1.0
 
@@ -267,6 +279,9 @@ class NILMFormer(Seq2SeqCNN):
         pffn_ratio: int = 4,
         n_head: int = 8,
         norm_eps: float = 1e-5,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.0,
+        scheduler_patience: int = 3,
     ) -> None:
         dilations = list(dilations or [1, 2, 4, 8])
         if c_embedding != 8:
@@ -280,6 +295,8 @@ class NILMFormer(Seq2SeqCNN):
             raise ValueError("NILMFormer layer dimensions must be positive.")
         if d_model % n_head != 0 or not 0.0 <= dp_rate < 1.0 or norm_eps <= 0:
             raise ValueError("Invalid NILMFormer attention, dropout, or normalization settings.")
+        if learning_rate <= 0 or weight_decay < 0 or scheduler_patience < 0:
+            raise ValueError("Invalid NILMFormer optimizer or scheduler configuration.")
         self.window_size = window_size
         self.output_size = window_size
         self.output_offset = 0
@@ -290,8 +307,8 @@ class NILMFormer(Seq2SeqCNN):
             "n_encoder_layers": n_encoder_layers, "d_model": d_model,
             "dp_rate": dp_rate, "pffn_ratio": pffn_ratio,
             "n_head": n_head, "norm_eps": norm_eps,
-            "learning_rate": 1e-4, "weight_decay": 0.01,
-            "warmup_fraction": 0.1, "gradient_clip_norm": 1.0,
+            "learning_rate": learning_rate, "weight_decay": weight_decay,
+            "scheduler_patience": scheduler_patience,
         }
         self.normalization = None
         config = NILMFormerConfig(
@@ -378,15 +395,24 @@ class NILMFormer(Seq2SeqCNN):
         return (output * output_std + output_mean).squeeze(1)
 
     def fit(self, train_data, validation_data, context: TrainingContext) -> FitResult:
-        """Run NILMFormer's AdamW, warmup/cosine, and clipping recipe."""
+        """Run the official MaxScaling, AdamW, and plateau-scheduler recipe."""
 
         del validation_data
-        self._set_normalization(train_data)
+        power_scale = float(
+            np.max(np.concatenate([series.aggregate for series in train_data.series]))
+        )
+        if not np.isfinite(power_scale) or power_scale <= 0:
+            raise ValueError("NILMFormer MaxScaling requires positive training aggregate power.")
+        self.normalization = {
+            "power_scale": power_scale,
+            "appliances": train_data.series[0].appliances,
+            "power_scaling_type": "MaxScaling",
+            "appliance_scaling_type": "SameAsPower",
+        }
         train_loader = DataLoader(
             NILMFormerDataset(train_data, self.window_size, self.normalization),
             batch_size=self.official_batch_size,
-            shuffle=True,
-            generator=torch.Generator().manual_seed(context.seed),
+            shuffle=False,
         )
 
         self.to(context.device)
@@ -394,16 +420,13 @@ class NILMFormer(Seq2SeqCNN):
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=learning_rate,
-            weight_decay=float(self._config.get("weight_decay", 0.01)),
-            betas=(0.9, 0.95),
+            weight_decay=float(self._config.get("weight_decay", 0.0)),
         )
-        total_steps = len(train_loader) * int(context.num_epochs)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            max_lr=learning_rate,
-            total_steps=total_steps,
-            pct_start=float(self._config.get("warmup_fraction", 0.1)),
-            anneal_strategy="cos",
+            mode="min",
+            patience=int(self._config.get("scheduler_patience", 3)),
+            eps=1e-7,
         )
         history = []
         best_epoch = None
@@ -419,21 +442,17 @@ class NILMFormer(Seq2SeqCNN):
                 optimizer.zero_grad()
                 loss = F.mse_loss(self(inputs), targets)
                 loss.backward()
-                nn.utils.clip_grad_norm_(
-                    self.parameters(),
-                    max_norm=float(self._config.get("gradient_clip_norm", 1.0)),
-                )
                 optimizer.step()
-                scheduler.step()
                 total += float(loss.item())
 
             train_loss = total / max(1, len(train_loader))
             validation = context.validate_candidate(epoch=epoch, model=self)
+            scheduler.step(validation.mse)
             record = {
                 "epoch": epoch,
                 "training_loss": train_loss,
                 "validation_mse": validation.mse,
-                "learning_rate": scheduler.get_last_lr()[0],
+                "learning_rate": optimizer.param_groups[0]["lr"],
             }
             history.append(record)
             if validation.improved:
@@ -452,19 +471,21 @@ class NILMFormer(Seq2SeqCNN):
 
     def _predict_segment(self, timestamps, aggregate, context):
         stats = self.normalization
-        half = self.window_size // 2
-        mains = np.pad(aggregate, (half, half))
-        calendar = np.pad(
-            _calendar_features(timestamps), ((0, 0), (half, half)), mode="edge"
-        )
-        windows = []
-        for index in range(len(aggregate)):
-            power_window = (
-                mains[index:index + self.window_size] - stats["mains_mean"]
-            ) / stats["mains_std"]
-            windows.append(np.concatenate(
-                (power_window[None, :], calendar[:, index:index + self.window_size])
-            ))
+        window_count = int(np.ceil(len(aggregate) / self.window_size))
+        padded_length = window_count * self.window_size
+        mains = np.zeros(padded_length, dtype=np.float32)
+        mains[: len(aggregate)] = aggregate
+        mains /= stats["power_scale"]
+        calendar = _calendar_features(_extend_timestamps(timestamps, padded_length))
+        windows = [
+            np.concatenate(
+                (
+                    mains[index : index + self.window_size][None, :],
+                    calendar[:, index : index + self.window_size],
+                )
+            )
+            for index in range(0, padded_length, self.window_size)
+        ]
         predicted = []
         with torch.inference_mode():
             for offset in range(0, len(windows), context.batch_size):
@@ -473,14 +494,8 @@ class NILMFormer(Seq2SeqCNN):
                     dtype=torch.float32, device=context.device,
                 )
                 predicted.append(self(inputs).cpu().numpy())
-        predicted = np.concatenate(predicted)
-        predicted = predicted * stats["appliance_std"] + stats["appliance_mean"]
-        sums = np.zeros(len(mains), dtype=np.float64)
-        counts = np.zeros(len(mains), dtype=np.float64)
-        for index, window in enumerate(predicted):
-            sums[index:index + self.window_size] += window
-            counts[index:index + self.window_size] += 1
-        return (sums[half:half + len(aggregate)] / counts[half:half + len(aggregate)]).astype(np.float32)
+        predicted = np.concatenate(predicted, axis=0).reshape(-1)
+        return (predicted[: len(aggregate)] * stats["power_scale"]).astype(np.float32)
 
     def predict(self, inference_data, context: InferenceContext):
         if self.normalization is None:
@@ -496,7 +511,8 @@ class NILMFormer(Seq2SeqCNN):
             start = 0
             while start < len(series.aggregate):
                 end = start + 1
-                while end < len(series.aggregate) and segments[end] == segments[start]: end += 1
+                while end < len(series.aggregate) and segments[end] == segments[start]:
+                    end += 1
                 output[start:end] = self._predict_segment(
                     series.timestamps[start:end], series.aggregate[start:end], context
                 )
@@ -506,5 +522,6 @@ class NILMFormer(Seq2SeqCNN):
             power_parts.append(output[:, None])
         return PredictionOutput(
             np.concatenate(timestamp_parts), np.concatenate(power_parts),
-            tuple(self.normalization["appliances"]), np.concatenate(household_parts)
+            tuple(self.normalization["appliances"]), np.concatenate(household_parts),
+            metadata={"inference_window_stride": self.window_size},
         )
