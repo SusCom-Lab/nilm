@@ -13,7 +13,7 @@ import torch.nn as nn
 from sklearn.metrics import average_precision_score, precision_recall_curve, precision_recall_fscore_support
 from torch.utils.data import DataLoader
 
-from model_pipeline.classical_data import load_grouped_classical_data
+from model_pipeline.classical_data import hide_classical_targets, load_grouped_classical_data
 from model_pipeline.contracts import InferenceContext, InferenceData
 from model_pipeline.data_protocol import household_id_from_path
 from model_pipeline.data_feeder import SlidingWindowDataset, reconstruct_series_from_windows
@@ -389,7 +389,9 @@ class Evaluator:
             self._joint_grouped_data = grouped
 
             time_start = time.time()
-            self.joint_results = self.model.disaggregate_joint(grouped)
+            self.joint_results = self.model.disaggregate_joint(
+                hide_classical_targets(grouped)
+            )
             self.dt = time.time() - time_start
 
             metric_rows = []

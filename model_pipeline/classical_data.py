@@ -19,6 +19,30 @@ class ClassicalGroup:
     appliances: dict[str, np.ndarray]
 
 
+@dataclass(frozen=True)
+class ClassicalInferenceGroup:
+    """Joint-model input that deliberately excludes appliance labels."""
+
+    group_id: str
+    time: pd.Series
+    aggregate: np.ndarray
+
+
+def hide_classical_targets(
+    grouped_data: dict[str, ClassicalGroup],
+) -> dict[str, ClassicalInferenceGroup]:
+    """Create target-free views for model-owned joint disaggregation."""
+
+    return {
+        group_id: ClassicalInferenceGroup(
+            group_id=group.group_id,
+            time=group.time,
+            aggregate=group.aggregate,
+        )
+        for group_id, group in grouped_data.items()
+    }
+
+
 def parse_house_id(csv_path: str) -> str:
     match = HOUSE_PATTERN.search(os.path.basename(csv_path))
     if match is None:

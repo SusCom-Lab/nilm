@@ -406,5 +406,5 @@ class JointClassicalNILMModel(ClassicalNILMModel):
     def fit_joint(self, grouped_train_data: dict[str, dict[str, Any]]) -> None:
         raise NotImplementedError(f"{self.__class__.__name__} must implement fit_joint().")
 
-    def disaggregate_joint(self, grouped_test_data: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    def disaggregate_joint(self, grouped_test_data: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError(f"{self.__class__.__name__} must implement disaggregate_joint().")

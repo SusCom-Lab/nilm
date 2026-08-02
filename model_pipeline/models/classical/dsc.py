@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from model_pipeline.classical_data import ClassicalGroup
+from model_pipeline.classical_data import ClassicalGroup, ClassicalInferenceGroup
 from model_pipeline.model_registry import register_model
 from model_pipeline.models.classical.afhmm import _deserialise_value, _serialise_value
 from model_pipeline.models.base_model import JointClassicalNILMModel
@@ -171,7 +171,10 @@ class DiscriminativeSparseCoding(JointClassicalNILMModel):
         self.reconstruction_bases = all_bases.astype(np.float32)
         self.disaggregation_bases = optimal_bases.astype(np.float32)
 
-    def disaggregate_joint(self, grouped_test_data: dict[str, ClassicalGroup]) -> dict[str, pd.DataFrame]:
+    def disaggregate_joint(
+        self,
+        grouped_test_data: dict[str, ClassicalInferenceGroup],
+    ) -> dict[str, pd.DataFrame]:
         if self.disaggregation_bases is None or self.reconstruction_bases is None:
             raise RuntimeError("DiscriminativeSparseCoding must be fitted before disaggregation.")
 

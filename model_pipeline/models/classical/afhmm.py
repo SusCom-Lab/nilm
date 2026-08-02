@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from model_pipeline.classical_data import ClassicalGroup
+from model_pipeline.classical_data import ClassicalGroup, ClassicalInferenceGroup
 from model_pipeline.model_registry import register_model
 from model_pipeline.models.base_model import JointClassicalNILMModel
 
@@ -213,7 +213,10 @@ class AFHMMBaseline(JointClassicalNILMModel):
             ).astype(np.float32)
         return pd.DataFrame(prediction_dict, dtype="float32")
 
-    def disaggregate_joint(self, grouped_test_data: dict[str, ClassicalGroup]) -> dict[str, pd.DataFrame]:
+    def disaggregate_joint(
+        self,
+        grouped_test_data: dict[str, ClassicalInferenceGroup],
+    ) -> dict[str, pd.DataFrame]:
         predictions: dict[str, pd.DataFrame] = {}
         for group_id, group in grouped_test_data.items():
             predictions[group_id] = self._solve_group(group.aggregate)
