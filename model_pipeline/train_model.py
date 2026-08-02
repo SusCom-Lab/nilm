@@ -309,51 +309,11 @@ class Trainer:
         self.selection_losses = []
         self.epoch_history = []
 
-    def _prepare_torch_batch(self, inputs, targets):
-        inputs = inputs.to(self.device)
-        targets = self.model.prepare_targets(targets.to(self.device))
-        return inputs, targets
-
-    def _prepare_loader_batch(self, batch):
-        hook = getattr(self.model, "prepare_batch", None)
-        if callable(hook):
-            return hook(batch, device=self.device)
-        if not isinstance(batch, (tuple, list)) or len(batch) != 2:
-            raise ValueError(
-                "Trainer batches must be (inputs, targets), unless model.prepare_batch is provided."
-            )
-        return self._prepare_torch_batch(batch[0], batch[1])
-
     def _should_early_stop(self, completed_epochs):
         return (
             int(completed_epochs) >= self.minimum_epochs
             and self.counter >= self.patience
         )
-
-    def _model_loss_hook(self):
-        hook = getattr(self.model, "compute_loss", None)
-        return hook if callable(hook) else None
-
-    def _torch_loss(self, inputs, targets):
-        hook = self._model_loss_hook()
-        if hook is not None:
-            loss_output = hook(inputs, targets, criterion=self.criterion)
-            if isinstance(loss_output, tuple):
-                loss, outputs = loss_output
-                return loss, self.model.prepare_outputs(outputs)
-            return loss_output, None
-
-        outputs = self.model(inputs)
-        outputs = self.model.prepare_outputs(outputs)
-        return self.criterion(outputs, targets), outputs
-
-    def _torch_selection_loss(self, inputs, targets):
-        hook = getattr(self.model, "compute_selection_loss", None)
-        if callable(hook):
-            return hook(inputs, targets, criterion=self.criterion)
-
-        loss, _ = self._torch_loss(inputs, targets)
-        return loss
 
     def _collect_numpy_loader(self, loader):
         all_inputs = []
@@ -436,27 +396,6 @@ class Trainer:
             "checkpoint_path": checkpoint_path,
             "should_stop": should_stop,
         }
-
-    def _validate_torch(self):
-        if self.validation_loader is None:
-            return None, None
-        self.model.eval()
-        val_loss = 0.0
-        selection_loss = 0.0
-        with torch.no_grad():
-            for batch in self.validation_loader:
-                inputs, targets = self._prepare_loader_batch(batch)
-                loss, _ = self._torch_loss(inputs, targets)
-                val_loss += loss.item()
-                selection_hook = getattr(self.model, "compute_selection_loss", None)
-                if callable(selection_hook):
-                    selected = selection_hook(inputs, targets, criterion=self.criterion)
-                else:
-                    selected = loss
-                selection_loss += selected.item()
-        val_loss /= max(1, len(self.validation_loader))
-        selection_loss /= max(1, len(self.validation_loader))
-        return val_loss, selection_loss
 
     def trainModel(self, num_epochs=10):
         if self.train_loader is None:

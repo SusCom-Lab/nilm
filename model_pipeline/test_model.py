@@ -11,12 +11,10 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.metrics import average_precision_score, precision_recall_curve, precision_recall_fscore_support
-from torch.utils.data import DataLoader
 
 from model_pipeline.classical_data import hide_classical_targets, load_grouped_classical_data
 from model_pipeline.contracts import InferenceContext, InferenceData
 from model_pipeline.data_protocol import household_id_from_path
-from model_pipeline.data_feeder import SlidingWindowDataset, reconstruct_series_from_windows
 from model_pipeline.model_registry import instantiate_from_checkpoint, load_checkpoint
 from model_pipeline.train_model import compute_metrics
 
@@ -242,28 +240,6 @@ class Evaluator:
         self.raw_aggregate = None if aggregate_series is None else np.asarray(aggregate_series, dtype=np.float32)
         self.raw_target = None if target_series is None else np.asarray(target_series, dtype=np.float32)
 
-        if test_loader is None and test_csv_dir is not None and not self.joint_mode:
-            if self.normalisation_params is None:
-                raise ValueError(
-                    "Evaluator requires training normalisation_params or a checkpoint containing normalisation_stats."
-                )
-            test_dataset = SlidingWindowDataset(
-                [test_csv_dir],
-                self.model.get_window_size(),
-                target_mode=self.model.get_target_type(),
-                output_size=self.model.get_output_size(),
-                output_offset=self.model.get_output_offset(),
-                normalisation_stats=self.normalisation_params,
-                include_temporal_features=bool(
-                    getattr(self.model, "requires_temporal_features", False)
-                ),
-            )
-            test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
-            self.normalisation_params = test_dataset.getNormalisationParams(test_csv_dir)
-            self.window_start_indices = test_dataset.get_window_locations()
-        else:
-            self.window_start_indices = None
-
         self.test_loader = test_loader
         if getattr(self.model, "supports_gradient", False):
             self.model.to(self.device)
@@ -277,19 +253,6 @@ class Evaluator:
         self.joint_results: dict[str, pd.DataFrame] = {}
         self.joint_metrics = pd.DataFrame()
         self._joint_grouped_data = None
-
-    @staticmethod
-    def predict_aggregate_loader(loader, forward_fn, *, device):
-        """Run aggregate-only inference without requiring or touching labels."""
-        prediction_windows = []
-        with torch.no_grad():
-            for batch in loader:
-                inputs = batch[0] if isinstance(batch, (tuple, list)) else batch
-                outputs = forward_fn(inputs.to(device))
-                prediction_windows.append(outputs.reshape(-1).detach().cpu().numpy())
-        if not prediction_windows:
-            raise ValueError("Prediction loader produced no windows.")
-        return np.concatenate(prediction_windows).astype(np.float32)
 
     @staticmethod
     def score_aligned_predictions(
@@ -349,36 +312,6 @@ class Evaluator:
             "beta_norm": tensor_norm(beta),
         }
 
-    def _run_batch(self, inputs, targets):
-        if getattr(self.model, "supports_gradient", False):
-            inputs = inputs.to(self.device)
-            targets = self.model.prepare_targets(targets.to(self.device))
-            loss_hook = getattr(self.model, "compute_loss", None)
-            if callable(loss_hook):
-                loss_output = loss_hook(inputs, targets, criterion=self.criterion)
-                if isinstance(loss_output, tuple):
-                    loss, outputs = loss_output
-                    outputs = self.model.prepare_outputs(outputs)
-                else:
-                    loss = loss_output
-                    outputs = self.model.prepare_outputs(self.model(inputs))
-            else:
-                outputs = self.model.prepare_outputs(self.model(inputs))
-                loss = self.criterion(outputs, targets)
-            loss = float(loss.item())
-            predictions = outputs.detach().cpu().numpy()
-            targets_np = targets.detach().cpu().numpy()
-            return predictions, targets_np, loss
-
-        inputs_np = inputs.detach().cpu().numpy()
-        targets_np = self.model.prepare_targets(targets.detach().cpu().numpy())
-        predictions = self.model.prepare_outputs(self.model.disaggregate(inputs_np))
-        loss = self.criterion(
-            torch.as_tensor(predictions, dtype=torch.float32),
-            torch.as_tensor(targets_np, dtype=torch.float32),
-        ).item()
-        return predictions, targets_np, loss
-
     def testModel(self):
         if self.joint_mode:
             if not self.test_csv_dir:
@@ -427,8 +360,10 @@ class Evaluator:
             self.joint_metrics = pd.DataFrame(metric_rows)
             return
 
-        if self.test_loader is None and not getattr(self.model, "supports_gradient", False):
-            raise ValueError("Evaluator requires a test_loader or test_csv_dir.")
+        if not getattr(self.model, "supports_gradient", False):
+            raise TypeError(
+                "Non-gradient plugins must implement the registered joint inference protocol."
+            )
 
         if self.test_csv_dir is not None:
             raw_df = pd.read_csv(self.test_csv_dir, low_memory=False)
@@ -513,47 +448,6 @@ class Evaluator:
             ).item()
             print(f"Test Loss: {test_loss}")
             return
-
-        appliance_mean = self.normalisation_params["appliance_mean"]
-        appliance_std = self.normalisation_params["appliance_std"]
-
-        prediction_windows = []
-        test_loss = 0.0
-        time_start = time.time()
-
-        if getattr(self.model, "supports_gradient", False):
-            self.model.eval()
-
-        with torch.no_grad() if getattr(self.model, "supports_gradient", False) else _nullcontext():
-            for inputs, targets in self.test_loader:
-                predictions, _, loss = self._run_batch(inputs, targets)
-                prediction_windows.append(predictions)
-                test_loss += loss
-
-        self.dt = time.time() - time_start
-        prediction_windows = np.concatenate(prediction_windows, axis=0)
-        prediction_windows = (prediction_windows * appliance_std) + appliance_mean
-
-        reconstructed, coverage = reconstruct_series_from_windows(
-            prediction_windows,
-            total_length,
-            target_mode=self.model.get_target_type(),
-            output_offset=self.model.get_output_offset(),
-            output_size=self.model.get_output_size(),
-            window_start_indices=self.window_start_indices,
-        )
-        valid_mask = coverage > 0
-
-        self.timestamps = raw_timestamps[valid_mask].reset_index(drop=True)
-        self.aggregate = np.clip(raw_aggregate[valid_mask], 0.0, None).tolist()
-        self.ground_truth = np.clip(raw_target[valid_mask], 0.0, None).tolist()
-        self.true_status = None if raw_status is None else raw_status[valid_mask].astype(np.int8).tolist()
-        predictions = np.clip(reconstructed[valid_mask], 0.0, None)
-        predictions = np.minimum(predictions, np.asarray(self.aggregate, dtype=np.float32))
-        self.predictions = predictions.tolist()
-
-        test_loss /= max(1, len(self.test_loader))
-        print(f"Test Loss: {test_loss}")
 
     def evaluate(self):
         self.testModel()
@@ -830,14 +724,6 @@ class Evaluator:
         plt.savefig(plot_path, bbox_inches="tight", dpi=300)
         plt.close()
         print(f"PR curve saved to {plot_path}")
-
-
-class _nullcontext:
-    def __enter__(self):
-        return None
-
-    def __exit__(self, exc_type, exc, exc_tb):
-        return False
 
 
 Tester = Evaluator
