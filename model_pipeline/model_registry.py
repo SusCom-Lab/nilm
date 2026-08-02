@@ -118,23 +118,18 @@ def instantiate_from_checkpoint(checkpoint: dict[str, Any], map_location: str | 
         raise KeyError("Checkpoint is missing 'model_key' or 'model_name'.")
 
     init_kwargs = dict(checkpoint.get("init_kwargs", {}))
-    if "window_size" not in init_kwargs and "window_length" in checkpoint:
-        init_kwargs["window_size"] = checkpoint["window_length"]
-    if "output_size" not in init_kwargs and "output_size" in checkpoint:
-        init_kwargs["output_size"] = checkpoint["output_size"]
-    if "output_offset" not in init_kwargs and "output_offset" in checkpoint:
-        init_kwargs["output_offset"] = checkpoint["output_offset"]
-
     model = create_model(model_name, **init_kwargs)
-
     state = checkpoint.get("model_state")
-    if state is None and "model_state_dict" in checkpoint:
-        state = checkpoint["model_state_dict"]
-
-    if state is not None:
-        if map_location is not None and hasattr(model, "load_exported_state"):
-            model.load_exported_state(state, map_location=map_location)
-        else:
-            model.load_exported_state(state)
+    if state is None:
+        raise KeyError("Checkpoint is missing 'model_state'.")
+    if hasattr(model, "load_state_dict"):
+        model.load_state_dict(state)
+        model.normalization = checkpoint.get("normalization")
+        if map_location is not None and hasattr(model, "to"):
+            model.to(map_location)
+    elif hasattr(model, "set_state"):
+        model.set_state(state)
+    else:
+        raise TypeError(f"{type(model).__name__} cannot restore its checkpoint state.")
 
     return model
