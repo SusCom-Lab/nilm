@@ -13,9 +13,58 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from model_pipeline.classical_data import ClassicalGroup, ClassicalInferenceGroup
+from dataclasses import dataclass
+
+import torch
+
+from model_pipeline.api import (
+    FitResult,
+    InferenceContext,
+    PredictionOutput,
+    TrainingContext,
+)
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.base_model import JointClassicalNILMModel
+
+
+@dataclass(frozen=True)
+class ClassicalGroup:
+    group_id: str
+    time: np.ndarray
+    aggregate: np.ndarray
+    appliances: dict[str, np.ndarray]
+
+
+@dataclass(frozen=True)
+class ClassicalInferenceGroup:
+    group_id: str
+    time: np.ndarray
+    aggregate: np.ndarray
+
+
+def supervised_groups(partition) -> dict[str, ClassicalGroup]:
+    return {
+        series.household_id: ClassicalGroup(
+            group_id=series.household_id,
+            time=series.timestamps,
+            aggregate=series.aggregate,
+            appliances={
+                name: series.appliance_power[:, index]
+                for index, name in enumerate(series.appliances)
+            },
+        )
+        for series in partition.series
+    }
+
+
+def inference_groups(partition) -> dict[str, ClassicalInferenceGroup]:
+    return {
+        series.household_id: ClassicalInferenceGroup(
+            group_id=series.household_id,
+            time=series.timestamps,
+            aggregate=series.aggregate,
+        )
+        for series in partition.series
+    }
 
 
 def _fit_gaussian_hmm(values: np.ndarray, n_states: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -63,9 +112,14 @@ def _deserialise_value(value: Any) -> Any:
 
 
 @register_model("afhmm", aliases=("AFHMM",), display_name="AFHMM")
-class AFHMMBaseline(JointClassicalNILMModel):
+class AFHMMBaseline:
     display_name = "AFHMM"
     model_family = "probabilistic"
+    target_type = "sequence"
+    supports_gradient = False
+    is_joint_classical = True
+    default_num_epochs = 1
+    official_batch_size = 1
 
     def __init__(
         self,
@@ -75,16 +129,19 @@ class AFHMMBaseline(JointClassicalNILMModel):
         optimisation_epochs: int = 6,
         sigma_floor: float = 1.0,
         solver: str = "SCS",
-        **kwargs,
     ):
-        super().__init__(
-            window_size=window_size,
-            n_states=n_states,
-            optimisation_epochs=optimisation_epochs,
-            sigma_floor=sigma_floor,
-            solver=solver,
-            **kwargs,
-        )
+        if (window_size, n_states, optimisation_epochs, sigma_floor, solver) != (
+            599, 2, 6, 1.0, "SCS"
+        ):
+            raise ValueError("AFHMM uses the fixed repository reference defaults.")
+        self.window_size = window_size
+        self._config = {
+            "window_size": window_size,
+            "n_states": n_states,
+            "optimisation_epochs": optimisation_epochs,
+            "sigma_floor": sigma_floor,
+            "solver": solver,
+        }
         self.n_states = n_states
         self.optimisation_epochs = optimisation_epochs
         self.sigma_floor = sigma_floor
@@ -95,11 +152,16 @@ class AFHMMBaseline(JointClassicalNILMModel):
         self.transmat_vector: dict[str, np.ndarray] = {}
         self.signal_aggregates: dict[str, float] = {}
 
-    def fit(self, aggregate_windows: np.ndarray, target_windows: np.ndarray) -> None:
-        raise NotImplementedError("AFHMMBaseline now uses fit_joint().")
-
-    def disaggregate(self, inputs: np.ndarray) -> np.ndarray:
-        raise NotImplementedError("AFHMMBaseline now uses disaggregate_joint().")
+    def fit(self, train_data, validation_data, context: TrainingContext) -> FitResult:
+        del validation_data
+        self.fit_joint(supervised_groups(train_data))
+        validation = context.validate_candidate(epoch=1, model=self)
+        return FitResult(
+            history=[{"epoch": 1, "validation_mse": validation.mse}],
+            best_epoch=1 if validation.improved else None,
+            best_validation_mse=validation.mse,
+            checkpoint_path=validation.checkpoint_path,
+        )
 
     def fit_joint(self, grouped_train_data: dict[str, ClassicalGroup]) -> None:
         if not grouped_train_data:
@@ -221,6 +283,44 @@ class AFHMMBaseline(JointClassicalNILMModel):
         for group_id, group in grouped_test_data.items():
             predictions[group_id] = self._solve_group(group.aggregate)
         return predictions
+
+    def predict(self, inference_data, context: InferenceContext) -> PredictionOutput:
+        del context
+        grouped = inference_groups(inference_data)
+        predictions = self.disaggregate_joint(grouped)
+        timestamps, households, powers = [], [], []
+        for series in inference_data.series:
+            frame = predictions[series.household_id]
+            missing = [name for name in series.appliances if name not in frame]
+            if missing:
+                raise ValueError(f"AFHMM prediction is missing appliances: {missing}.")
+            timestamps.append(series.timestamps)
+            households.append(np.repeat(series.household_id, len(series.timestamps)))
+            powers.append(frame[list(series.appliances)].to_numpy(dtype=np.float32))
+        return PredictionOutput(
+            timestamps=np.concatenate(timestamps),
+            power=np.concatenate(powers),
+            appliances=inference_data.series[0].appliances,
+            household_ids=np.concatenate(households),
+        )
+
+    def save(self, path, *, metadata=None) -> None:
+        torch.save(
+            {
+                "model_key": self._registry_key,
+                "init_kwargs": dict(self._config),
+                "model_state": self.get_state(),
+                "metadata": dict(metadata or {}),
+            },
+            path,
+        )
+
+    def load(self, path, device="cpu") -> None:
+        try:
+            checkpoint = torch.load(path, map_location=device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(path, map_location=device)
+        self.set_state(checkpoint["model_state"])
 
     def get_state(self) -> dict[str, Any]:
         return _serialise_value(

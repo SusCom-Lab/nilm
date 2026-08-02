@@ -12,16 +12,29 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from model_pipeline.classical_data import ClassicalGroup, ClassicalInferenceGroup
+import torch
+
+from model_pipeline.api import FitResult, InferenceContext, PredictionOutput, TrainingContext
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.classical.afhmm import _deserialise_value, _serialise_value
-from model_pipeline.models.base_model import JointClassicalNILMModel
+from model_pipeline.models.classical.afhmm import (
+    ClassicalGroup,
+    ClassicalInferenceGroup,
+    _deserialise_value,
+    _serialise_value,
+    inference_groups,
+    supervised_groups,
+)
 
 
 @register_model("dsc", aliases=("DSC",), display_name="DSC")
-class DiscriminativeSparseCoding(JointClassicalNILMModel):
+class DiscriminativeSparseCoding:
     display_name = "DSC"
     model_family = "probabilistic"
+    target_type = "sequence"
+    supports_gradient = False
+    is_joint_classical = True
+    default_num_epochs = 1
+    official_batch_size = 1
 
     def __init__(
         self,
@@ -31,16 +44,19 @@ class DiscriminativeSparseCoding(JointClassicalNILMModel):
         iterations: int = 3000,
         sparsity_coef: float = 20,
         n_components: int = 10,
-        **kwargs,
     ):
-        super().__init__(
-            window_size=window_size,
-            learning_rate=learning_rate,
-            iterations=iterations,
-            sparsity_coef=sparsity_coef,
-            n_components=n_components,
-            **kwargs,
-        )
+        if (window_size, learning_rate, iterations, sparsity_coef, n_components) != (
+            120, 1e-9, 3000, 20, 10
+        ):
+            raise ValueError("DSC uses the fixed official default configuration.")
+        self.window_size = window_size
+        self._config = {
+            "window_size": window_size,
+            "learning_rate": learning_rate,
+            "iterations": iterations,
+            "sparsity_coef": sparsity_coef,
+            "n_components": n_components,
+        }
         self.learning_rate = learning_rate
         self.iterations = iterations
         self.sparsity_coef = sparsity_coef
@@ -51,11 +67,16 @@ class DiscriminativeSparseCoding(JointClassicalNILMModel):
         self.disaggregation_bases: np.ndarray | None = None
         self.component_slices: dict[str, tuple[int, int]] = {}
 
-    def fit(self, aggregate_windows: np.ndarray, target_windows: np.ndarray) -> None:
-        raise NotImplementedError("DiscriminativeSparseCoding now uses fit_joint().")
-
-    def disaggregate(self, inputs: np.ndarray) -> np.ndarray:
-        raise NotImplementedError("DiscriminativeSparseCoding now uses disaggregate_joint().")
+    def fit(self, train_data, validation_data, context: TrainingContext) -> FitResult:
+        del validation_data
+        self.fit_joint(supervised_groups(train_data))
+        validation = context.validate_candidate(epoch=1, model=self)
+        return FitResult(
+            history=[{"epoch": 1, "validation_mse": validation.mse}],
+            best_epoch=1 if validation.improved else None,
+            best_validation_mse=validation.mse,
+            checkpoint_path=validation.checkpoint_path,
+        )
 
     def _reshape_power(self, values: np.ndarray) -> np.ndarray:
         values = np.asarray(values, dtype=np.float32).reshape(-1)
@@ -201,6 +222,39 @@ class DiscriminativeSparseCoding(JointClassicalNILMModel):
                 outputs[appliance_name] = np.clip(predicted_usage, 0.0, group.aggregate)
             predictions[group_id] = pd.DataFrame(outputs, dtype="float32")
         return predictions
+
+    def predict(self, inference_data, context: InferenceContext) -> PredictionOutput:
+        del context
+        predictions = self.disaggregate_joint(inference_groups(inference_data))
+        timestamps, households, powers = [], [], []
+        for series in inference_data.series:
+            frame = predictions[series.household_id]
+            timestamps.append(series.timestamps)
+            households.append(np.repeat(series.household_id, len(series.timestamps)))
+            powers.append(frame[list(series.appliances)].to_numpy(dtype=np.float32))
+        return PredictionOutput(
+            timestamps=np.concatenate(timestamps),
+            power=np.concatenate(powers),
+            appliances=inference_data.series[0].appliances,
+            household_ids=np.concatenate(households),
+        )
+
+    def save(self, path, *, metadata=None) -> None:
+        torch.save(
+            {
+                "model_key": self._registry_key,
+                "init_kwargs": dict(self._config),
+                "model_state": self.get_state(),
+                "metadata": dict(metadata or {}),
+            }, path,
+        )
+
+    def load(self, path, device="cpu") -> None:
+        try:
+            checkpoint = torch.load(path, map_location=device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(path, map_location=device)
+        self.set_state(checkpoint["model_state"])
 
     def get_state(self) -> dict[str, Any]:
         return _serialise_value(
