@@ -313,7 +313,7 @@ class WindowGRU(RNNBaseline):
                             dtype=torch.float32,
                             device=context.device,
                         )
-                        batches.append(self(inputs).cpu().numpy())
+                        batches.append(self.prepare_outputs(self(inputs)).cpu().numpy())
                     output[start:end] = np.concatenate(batches) * self.max_val
                     start = end
                 timestamps.append(series.timestamps)
