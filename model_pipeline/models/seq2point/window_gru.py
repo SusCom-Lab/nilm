@@ -67,7 +67,14 @@ class FastReLUGRU(nn.Module):
 class WindowGRUDataset(Dataset):
     """Official forward-looking windows with end padding and scalar targets."""
 
-    def __init__(self, partition, window_size: int, max_val: float) -> None:
+    def __init__(
+        self,
+        partition,
+        window_size: int,
+        max_val: float,
+        *,
+        include_status: bool = False,
+    ) -> None:
         self.inputs = []
         self.targets = []
         for series in partition.series:
@@ -91,12 +98,18 @@ class WindowGRUDataset(Dataset):
                             dtype=torch.float32,
                         )
                     )
-                    self.targets.append(
-                        torch.tensor(
-                            series.appliance_power[start + index, 0] / max_val,
-                            dtype=torch.float32,
+                    target = series.appliance_power[start + index, 0] / max_val
+                    if include_status:
+                        if series.status is None:
+                            raise ValueError("This WindowGRU variant requires public status labels.")
+                        self.targets.append(
+                            torch.tensor(
+                                (target, series.status[start + index, 0]),
+                                dtype=torch.float32,
+                            )
                         )
-                    )
+                    else:
+                        self.targets.append(torch.tensor(target, dtype=torch.float32))
                 start = end
 
     def __len__(self):
@@ -169,6 +182,18 @@ class WindowGRU(RNNBaseline):
         hidden = self.dropout3(torch.relu(self.fc1(hidden)))
         return self.fc2(hidden).reshape(-1)
 
+    @staticmethod
+    def prepare_targets(targets):
+        if isinstance(targets, torch.Tensor):
+            return targets.float().reshape(-1)
+        return np.asarray(targets, dtype=np.float32).reshape(-1)
+
+    @staticmethod
+    def prepare_outputs(outputs):
+        if isinstance(outputs, torch.Tensor):
+            return outputs.float().reshape(-1)
+        return np.asarray(outputs, dtype=np.float32).reshape(-1)
+
     def fit(self, train_data, validation_data, context: TrainingContext) -> FitResult:
         del validation_data
         self.normalization = {
@@ -176,7 +201,12 @@ class WindowGRU(RNNBaseline):
             "appliances": train_data.series[0].appliances,
         }
         loader = DataLoader(
-            WindowGRUDataset(train_data, self.window_size, self.max_val),
+            WindowGRUDataset(
+                train_data,
+                self.window_size,
+                self.max_val,
+                include_status=bool(getattr(self, "requires_status_targets", False)),
+            ),
             batch_size=self.official_batch_size,
             shuffle=True,
             generator=torch.Generator().manual_seed(context.seed),
@@ -199,8 +229,14 @@ class WindowGRU(RNNBaseline):
             total = 0.0
             for inputs, targets in loader:
                 optimizer.zero_grad()
-                outputs = self(inputs.to(context.device))
-                loss = criterion(outputs, targets.to(context.device))
+                inputs = inputs.to(context.device)
+                targets = targets.to(context.device)
+                loss_hook = getattr(self, "compute_loss", None)
+                if callable(loss_hook):
+                    loss_result = loss_hook(inputs, targets, criterion=criterion)
+                    loss = loss_result[0] if isinstance(loss_result, tuple) else loss_result
+                else:
+                    loss = criterion(self(inputs), targets)
                 loss.backward()
                 optimizer.step()
                 total += float(loss.item())

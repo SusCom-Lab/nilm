@@ -95,6 +95,7 @@ class InvariantStateAwareSeq2Point(Seq2Point):
         self.power_head = nn.Linear(hidden_dim, 1)
         self.state_head = nn.Linear(hidden_dim, 1)
         self.house_head = nn.Linear(hidden_dim, self.num_domains)
+        self._initialize_weights()
 
     def prepare_targets(self, targets):
         if isinstance(targets, torch.Tensor) and self.target_type == "point" and targets.ndim == 2 and targets.size(-1) == 2:

@@ -16,8 +16,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.seq2point.seq2point import Seq2Point
 from model_pipeline.models.seq2point.seq2point_invariant_state_aware import GradientReversal
+from model_pipeline.models.seq2point.window_gru import FastReLUGRU, WindowGRU
 
 
 @register_model(
@@ -25,7 +25,7 @@ from model_pipeline.models.seq2point.seq2point_invariant_state_aware import Grad
     aliases=("InvariantStateAwareWindowGRU", "isa_window_gru"),
     display_name="InvariantStateAwareWindowGRU",
 )
-class InvariantStateAwareWindowGRU(Seq2Point):
+class InvariantStateAwareWindowGRU(WindowGRU):
     display_name = "InvariantStateAwareWindowGRU"
     model_family = "rnn"
     target_type = "point"
@@ -38,6 +38,7 @@ class InvariantStateAwareWindowGRU(Seq2Point):
         *,
         window_size: int = 599,
         hidden_dim: int = 128,
+        max_val: float = 800.0,
         state_threshold: float = 0.0,
         state_loss_weight: float = 0.05,
         state_pos_weight: float | None = None,
@@ -48,9 +49,10 @@ class InvariantStateAwareWindowGRU(Seq2Point):
         nn.Module.__init__(self)
         self.window_size = window_size
         self.output_size = 1
-        self.output_offset = window_size // 2
+        self.output_offset = 0
+        self.max_val = float(max_val)
         self._config = {
-            "window_size": window_size, "hidden_dim": hidden_dim,
+            "window_size": window_size, "hidden_dim": hidden_dim, "max_val": max_val,
             "state_threshold": state_threshold, "state_loss_weight": state_loss_weight,
             "state_pos_weight": state_pos_weight, "num_domains": num_domains,
             "house_loss_weight": house_loss_weight, "grl_lambda": grl_lambda,
@@ -64,9 +66,13 @@ class InvariantStateAwareWindowGRU(Seq2Point):
         self.grl_lambda = float(grl_lambda)
 
         self.conv1 = nn.Conv1d(1, 16, kernel_size=4, padding=2)
-        self.gru1 = nn.GRU(16, 64, batch_first=True, bidirectional=True)
+        self.gru1 = FastReLUGRU(
+            16, 64, batch_first=True, bidirectional=True, return_sequences=True
+        )
         self.dropout1 = nn.Dropout(0.5)
-        self.gru2 = nn.GRU(128, 128, batch_first=True, bidirectional=True)
+        self.gru2 = FastReLUGRU(
+            128, 128, batch_first=True, bidirectional=True, return_sequences=False
+        )
         self.dropout2 = nn.Dropout(0.5)
         self.fc1 = nn.Linear(256, hidden_dim)
         self.dropout3 = nn.Dropout(0.5)
@@ -74,6 +80,7 @@ class InvariantStateAwareWindowGRU(Seq2Point):
         self.state_head = nn.Linear(hidden_dim, 1)
         self.house_head = nn.Linear(hidden_dim, self.num_domains)
         self.last_state_logits: torch.Tensor | None = None
+        WindowGRU._initialize_weights(self)
 
     def prepare_targets(self, targets):
         if isinstance(targets, torch.Tensor) and targets.ndim == 2 and targets.size(-1) == 2:
@@ -91,8 +98,7 @@ class InvariantStateAwareWindowGRU(Seq2Point):
         x = x.permute(0, 2, 1)
         x, _ = self.gru1(x)
         x = self.dropout1(x)
-        _, hidden = self.gru2(x)
-        x = torch.cat([hidden[-2], hidden[-1]], dim=1)
+        _, x = self.gru2(x)
         x = self.dropout2(x)
         x = torch.relu(self.fc1(x))
         return self.dropout3(x)
