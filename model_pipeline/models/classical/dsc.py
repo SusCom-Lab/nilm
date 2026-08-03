@@ -1,29 +1,248 @@
-"""
-DSC baseline adapted to joint multi-appliance disaggregation.
+"""Official Torch DSC algorithm behind the repository plugin interface.
 
-Official source: https://github.com/nilmtk/nilmtk-contrib/blob/14efd545e09d836e02159b23444350af92c6ee70/nilmtk_contrib/torch/dsc.py
-Local adaptation: joint-house repository plugin interface.
+Official source: https://github.com/nilmtk/nilmtk-contrib/blob/14efd545e09d836e02159b23444350af92c6ee70/nilmtk_contrib/torch/_dsc.py
+Local adaptation: canonical household partitions and unified checkpoint/evaluation API.
 """
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from dataclasses import asdict, dataclass
+import math
 from typing import Any
 
 import numpy as np
-import pandas as pd
-
 import torch
 
 from model_pipeline.api import FitResult, InferenceContext, PredictionOutput, TrainingContext
 from model_pipeline.model_registry import register_model
-from model_pipeline.models.classical.afhmm import (
-    ClassicalGroup,
-    ClassicalInferenceGroup,
-    _deserialise_value,
-    _serialise_value,
-    inference_groups,
-    supervised_groups,
-)
+from model_pipeline.models.classical.afhmm import _deserialise_value, _serialise_value
+
+
+@dataclass(frozen=True)
+class SparseCodeResult:
+    codes: torch.Tensor
+    objective: float
+    iterations: int
+    converged: bool
+
+
+@dataclass(frozen=True)
+class _DSCParameters:
+    reconstruction_dictionary: tuple[tuple[float, ...], ...]
+    discriminative_dictionary: tuple[tuple[float, ...], ...]
+    training_windows: int
+    reconstruction_objective: float
+    reconstruction_iterations: int
+    reconstruction_converged: bool
+    activation_error: float
+
+
+def _sparse_objective(dictionary, observations, codes, coefficient):
+    residual = observations - dictionary @ codes
+    return 0.5 * residual.square().sum() + coefficient * codes.sum()
+
+
+@torch.no_grad()
+def nonnegative_sparse_code(
+    dictionary: torch.Tensor,
+    observations: torch.Tensor,
+    *,
+    sparsity_coefficient: float,
+    max_iterations: int = 200,
+    tolerance: float = 1e-6,
+) -> SparseCodeResult:
+    """Official monotone accelerated proximal-gradient non-negative LASSO."""
+    spectral_norm = torch.linalg.matrix_norm(dictionary, ord=2)
+    lipschitz = spectral_norm.square()
+    if not bool(torch.isfinite(lipschitz)) or float(lipschitz) <= 0:
+        raise ValueError("dictionary must have a positive finite spectral norm.")
+    step = lipschitz.reciprocal()
+    threshold = step * sparsity_coefficient
+    codes = torch.zeros(
+        (dictionary.shape[1], observations.shape[1]),
+        dtype=dictionary.dtype,
+        device=dictionary.device,
+    )
+    extrapolated = codes.clone()
+    momentum = 1.0
+    objective = _sparse_objective(dictionary, observations, codes, sparsity_coefficient)
+    converged = False
+    for iteration in range(1, max_iterations + 1):
+        gradient = dictionary.T @ (dictionary @ extrapolated - observations)
+        candidate = torch.clamp(extrapolated - step * gradient - threshold, min=0)
+        candidate_objective = _sparse_objective(
+            dictionary, observations, candidate, sparsity_coefficient
+        )
+        if candidate_objective > objective:
+            momentum = 1.0
+            gradient = dictionary.T @ (dictionary @ codes - observations)
+            candidate = torch.clamp(codes - step * gradient - threshold, min=0)
+            candidate_objective = _sparse_objective(
+                dictionary, observations, candidate, sparsity_coefficient
+            )
+        if not bool(torch.isfinite(candidate_objective)):
+            raise RuntimeError("Sparse coding produced non-finite values.")
+        change = torch.linalg.vector_norm(candidate - codes)
+        scale = 1.0 + torch.linalg.vector_norm(codes)
+        next_momentum = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * momentum**2))
+        extrapolated = candidate + (momentum - 1.0) / next_momentum * (candidate - codes)
+        codes, objective, momentum = candidate, candidate_objective, next_momentum
+        if float(change) <= tolerance * float(scale):
+            converged = True
+            break
+    return SparseCodeResult(codes, float(objective), iteration, converged)
+
+
+def _normalize_dictionary(dictionary, fallback):
+    dictionary = torch.clamp(dictionary, min=0)
+    norms = torch.linalg.vector_norm(dictionary, dim=0)
+    missing = norms <= torch.finfo(dictionary.dtype).eps
+    if bool(missing.any()):
+        replacement = torch.clamp(fallback, min=0)
+        replacement_norm = torch.linalg.vector_norm(replacement)
+        if float(replacement_norm) <= torch.finfo(dictionary.dtype).eps:
+            replacement = torch.ones_like(replacement)
+            replacement_norm = torch.linalg.vector_norm(replacement)
+        dictionary[:, missing] = (replacement / replacement_norm)[:, None]
+        norms = torch.linalg.vector_norm(dictionary, dim=0)
+    return dictionary / norms.clamp_min(torch.finfo(dictionary.dtype).eps)
+
+
+def _learn_dictionary(
+    observations,
+    *,
+    n_components,
+    sparsity_coefficient,
+    dictionary_iterations,
+    sparse_code_iterations,
+    tolerance,
+):
+    if not bool((observations > 0).any()):
+        raise ValueError("Appliance training data must contain positive power.")
+    indices = torch.arange(n_components, device=observations.device).remainder(
+        observations.shape[1]
+    )
+    fallback = observations.mean(dim=1)
+    dictionary = _normalize_dictionary(observations[:, indices].clone(), fallback)
+    best_dictionary = dictionary.clone()
+    best_result = nonnegative_sparse_code(
+        dictionary,
+        observations,
+        sparsity_coefficient=sparsity_coefficient,
+        max_iterations=sparse_code_iterations,
+        tolerance=tolerance,
+    )
+    best_objective = best_result.objective
+    for _ in range(dictionary_iterations):
+        code_result = nonnegative_sparse_code(
+            dictionary,
+            observations,
+            sparsity_coefficient=sparsity_coefficient,
+            max_iterations=sparse_code_iterations,
+            tolerance=tolerance,
+        )
+        codes = code_result.codes
+        lipschitz = torch.linalg.matrix_norm(codes, ord=2).square()
+        if float(lipschitz) <= torch.finfo(dictionary.dtype).eps:
+            break
+        candidate = _normalize_dictionary(
+            dictionary + (observations - dictionary @ codes) @ codes.T / lipschitz,
+            fallback,
+        )
+        candidate_result = nonnegative_sparse_code(
+            candidate,
+            observations,
+            sparsity_coefficient=sparsity_coefficient,
+            max_iterations=sparse_code_iterations,
+            tolerance=tolerance,
+        )
+        if candidate_result.objective >= best_objective:
+            break
+        relative = (best_objective - candidate_result.objective) / max(
+            1.0, abs(best_objective)
+        )
+        best_dictionary, best_result = candidate.clone(), candidate_result
+        best_objective, dictionary = candidate_result.objective, candidate
+        if relative <= tolerance:
+            break
+    return best_dictionary, best_result
+
+
+def _dictionary_step(aggregate, dictionary, predicted, target, learning_rate, fallback):
+    gradient = ((aggregate - dictionary @ predicted) @ predicted.T) - (
+        (aggregate - dictionary @ target) @ target.T
+    )
+    if float(torch.linalg.vector_norm(gradient)) <= torch.finfo(dictionary.dtype).eps:
+        return None
+    return _normalize_dictionary(dictionary - learning_rate * gradient, fallback)
+
+
+def _fit_discriminative_dictionary(
+    aggregate,
+    reconstruction_dictionary,
+    target_codes,
+    *,
+    sparsity_coefficient,
+    discriminative_iterations,
+    sparse_code_iterations,
+    tolerance,
+    learning_rate,
+):
+    dictionary = reconstruction_dictionary.clone()
+    fallback = dictionary.mean(dim=1)
+    validation_windows = int(aggregate.shape[1] * 0.2)
+    if validation_windows:
+        train_x, val_x = aggregate[:, :-validation_windows], aggregate[:, -validation_windows:]
+        train_y, val_y = target_codes[:, :-validation_windows], target_codes[:, -validation_windows:]
+    else:
+        train_x = val_x = aggregate
+        train_y = val_y = target_codes
+    predicted = nonnegative_sparse_code(
+        dictionary, train_x, sparsity_coefficient=sparsity_coefficient,
+        max_iterations=sparse_code_iterations, tolerance=tolerance
+    )
+    val_predicted = predicted if not validation_windows else nonnegative_sparse_code(
+        dictionary, val_x, sparsity_coefficient=sparsity_coefficient,
+        max_iterations=sparse_code_iterations, tolerance=tolerance
+    )
+    best_error = float(torch.mean(torch.abs(val_predicted.codes - val_y)))
+    best_dictionary = dictionary.clone()
+    for _ in range(discriminative_iterations):
+        candidate = _dictionary_step(
+            train_x, dictionary, predicted.codes, train_y, learning_rate, fallback
+        )
+        if candidate is None:
+            break
+        change = torch.linalg.vector_norm(candidate - dictionary)
+        scale = 1.0 + torch.linalg.vector_norm(dictionary)
+        dictionary = candidate
+        predicted = nonnegative_sparse_code(
+            dictionary, train_x, sparsity_coefficient=sparsity_coefficient,
+            max_iterations=sparse_code_iterations, tolerance=tolerance
+        )
+        val_predicted = predicted if not validation_windows else nonnegative_sparse_code(
+            dictionary, val_x, sparsity_coefficient=sparsity_coefficient,
+            max_iterations=sparse_code_iterations, tolerance=tolerance
+        )
+        error = float(torch.mean(torch.abs(val_predicted.codes - val_y)))
+        if error < best_error:
+            best_error, best_dictionary = error, dictionary.clone()
+        if float(change) <= tolerance * float(scale):
+            break
+    return best_dictionary, best_error
+
+
+def _windows(values, shape):
+    values = torch.as_tensor(values, dtype=torch.float32).flatten()
+    padding = (-values.numel()) % shape
+    if padding:
+        values = torch.nn.functional.pad(values, (0, padding))
+    return values.reshape(-1, shape).T
+
+
+def _matrix_tuple(values):
+    return tuple(tuple(float(value) for value in row) for row in values.cpu().double())
 
 
 @register_model("dsc", aliases=("DSC",), display_name="DSC")
@@ -40,34 +259,74 @@ class DiscriminativeSparseCoding:
         self,
         *,
         window_size: int = 120,
-        learning_rate: float = 1e-9,
-        iterations: int = 3000,
-        sparsity_coef: float = 20,
         n_components: int = 10,
+        sparsity_coef: float = 20.0,
+        dictionary_iterations: int = 20,
+        iterations: int = 20,
+        sparse_code_iterations: int = 100,
+        tolerance: float = 1e-5,
+        learning_rate: float = 1e-9,
+        enforce_aggregate: bool = True,
     ):
-        if min(window_size, learning_rate, iterations, sparsity_coef, n_components) <= 0:
-            raise ValueError("DSC hyperparameters must be positive.")
+        if min(window_size, n_components, sparse_code_iterations) < 1:
+            raise ValueError("DSC integer hyperparameters must be positive.")
         self.window_size = window_size
-        self._config = {
-            "window_size": window_size,
-            "learning_rate": learning_rate,
-            "iterations": iterations,
-            "sparsity_coef": sparsity_coef,
-            "n_components": n_components,
-        }
-        self.learning_rate = learning_rate
-        self.iterations = iterations
-        self.sparsity_coef = sparsity_coef
         self.n_components = n_components
-        self.appliance_order: list[str] = []
-        self.dictionary_components: dict[str, np.ndarray] = {}
-        self.reconstruction_bases: np.ndarray | None = None
-        self.disaggregation_bases: np.ndarray | None = None
-        self.component_slices: dict[str, tuple[int, int]] = {}
+        self.sparsity_coef = float(sparsity_coef)
+        self.dictionary_iterations = dictionary_iterations
+        self.iterations = iterations
+        self.sparse_code_iterations = sparse_code_iterations
+        self.tolerance = tolerance
+        self.learning_rate = learning_rate
+        self.enforce_aggregate = enforce_aggregate
+        self._config = dict(
+            window_size=window_size, n_components=n_components,
+            sparsity_coef=sparsity_coef, dictionary_iterations=dictionary_iterations,
+            iterations=iterations, sparse_code_iterations=sparse_code_iterations,
+            tolerance=tolerance, learning_rate=learning_rate,
+            enforce_aggregate=enforce_aggregate,
+        )
+        self.models: OrderedDict[str, _DSCParameters] = OrderedDict()
 
     def fit(self, train_data, validation_data, context: TrainingContext) -> FitResult:
         del validation_data
-        self.fit_joint(supervised_groups(train_data))
+        mains = torch.cat([_windows(s.aggregate, self.window_size) for s in train_data.series], dim=1)
+        names = tuple(train_data.series[0].appliances)
+        targets = OrderedDict(
+            (name, torch.cat([
+                _windows(s.appliance_power[:, s.appliances.index(name)], self.window_size)
+                for s in train_data.series
+            ], dim=1)) for name in names
+        )
+        reconstruction, target_codes, results = OrderedDict(), OrderedDict(), OrderedDict()
+        for name, observations in targets.items():
+            dictionary, result = _learn_dictionary(
+                observations, n_components=self.n_components,
+                sparsity_coefficient=self.sparsity_coef,
+                dictionary_iterations=self.dictionary_iterations,
+                sparse_code_iterations=self.sparse_code_iterations,
+                tolerance=self.tolerance,
+            )
+            reconstruction[name], target_codes[name], results[name] = dictionary, result.codes, result
+        joint_reconstruction = torch.cat(tuple(reconstruction.values()), dim=1)
+        joint_codes = torch.cat(tuple(target_codes.values()), dim=0)
+        joint_discriminative, activation_error = _fit_discriminative_dictionary(
+            mains, joint_reconstruction, joint_codes,
+            sparsity_coefficient=self.sparsity_coef,
+            discriminative_iterations=self.iterations,
+            sparse_code_iterations=self.sparse_code_iterations,
+            tolerance=self.tolerance, learning_rate=self.learning_rate,
+        )
+        fitted, start = OrderedDict(), 0
+        for name, dictionary in reconstruction.items():
+            stop = start + self.n_components
+            fitted[name] = _DSCParameters(
+                _matrix_tuple(dictionary), _matrix_tuple(joint_discriminative[:, start:stop]),
+                int(mains.shape[1]), results[name].objective, results[name].iterations,
+                results[name].converged, activation_error,
+            )
+            start = stop
+        self.models = fitted
         validation = context.validate_candidate(epoch=1, model=self)
         return FitResult(
             history=[{"epoch": 1, "validation_mse": validation.mse}],
@@ -76,176 +335,50 @@ class DiscriminativeSparseCoding:
             checkpoint_path=validation.checkpoint_path,
         )
 
-    def _reshape_power(self, values: np.ndarray) -> np.ndarray:
-        values = np.asarray(values, dtype=np.float32).reshape(-1)
-        if values.size % self.window_size != 0:
-            extra_values = self.window_size - (values.size % self.window_size)
-            values = np.concatenate([values, np.zeros(extra_values, dtype=np.float32)])
-        return values.reshape((-1, self.window_size)).T
-
-    def _learn_dictionary(self, appliance_main: np.ndarray):
-        from sklearn.decomposition import MiniBatchDictionaryLearning
-
-        model = MiniBatchDictionaryLearning(
-            n_components=self.n_components,
-            fit_algorithm="cd",
-            positive_code=True,
-            positive_dict=True,
-            transform_algorithm="lasso_lars",
-            alpha=self.sparsity_coef,
-        )
-        model.fit(appliance_main.T)
-        return model
-
-    def _discriminative_training(
-        self,
-        optimal_activations: np.ndarray,
-        initial_bases: np.ndarray,
-        total_power: np.ndarray,
-    ) -> np.ndarray:
-        from sklearn.decomposition import SparseCoder
-
-        predicted_bases = np.copy(initial_bases)
-        optimal_activations = np.copy(optimal_activations)
-        alpha = self.learning_rate
-        least_error = float("inf")
-        best_bases = np.copy(initial_bases)
-
-        validation_size = max(1, int(total_power.shape[1] * 0.20))
-        train_power = total_power[:, :-validation_size]
-        val_power = total_power[:, -validation_size:]
-        train_optimal_a = optimal_activations[:, :-validation_size]
-        val_optimal_a = optimal_activations[:, -validation_size:]
-
-        for _ in range(self.iterations):
-            train_coder = SparseCoder(
-                dictionary=predicted_bases.T,
-                positive_code=True,
-                transform_algorithm="lasso_lars",
-                transform_alpha=self.sparsity_coef,
-            )
-            train_predicted_a = train_coder.transform(train_power.T).T
-
-            val_coder = SparseCoder(
-                dictionary=predicted_bases.T,
-                positive_code=True,
-                transform_algorithm="lasso_lars",
-                transform_alpha=self.sparsity_coef,
-            )
-            val_predicted_a = val_coder.transform(val_power.T).T
-            error = float(np.mean(np.abs(val_predicted_a - val_optimal_a)))
-
-            if error < least_error:
-                least_error = error
-                best_bases = np.copy(predicted_bases)
-
-            term_1 = (train_power - predicted_bases @ train_predicted_a) @ train_predicted_a.T
-            term_2 = (train_power - predicted_bases @ train_optimal_a) @ train_optimal_a.T
-            predicted_bases = predicted_bases - alpha * (term_1 - term_2)
-            predicted_bases = np.where(predicted_bases > 0, predicted_bases, 0)
-            norms = np.linalg.norm(predicted_bases.T, axis=1).reshape((-1, 1))
-            norms = np.where(norms < 1e-8, 1.0, norms)
-            predicted_bases = (predicted_bases.T / norms).T
-
-        return best_bases
-
-    def fit_joint(self, grouped_train_data: dict[str, ClassicalGroup]) -> None:
-        if not grouped_train_data:
-            raise ValueError("DiscriminativeSparseCoding requires non-empty grouped training data.")
-
-        appliance_names = sorted(next(iter(grouped_train_data.values())).appliances.keys())
-        self.appliance_order = appliance_names
-
-        aggregate_series = []
-        appliance_series: dict[str, list[np.ndarray]] = {name: [] for name in appliance_names}
-        for group in grouped_train_data.values():
-            if sorted(group.appliances.keys()) != appliance_names:
-                raise ValueError("All grouped training entries must contain the same appliance set.")
-            aggregate_series.append(group.aggregate)
-            for appliance_name in appliance_names:
-                appliance_series[appliance_name].append(group.appliances[appliance_name])
-
-        total_power = self._reshape_power(np.concatenate(aggregate_series, axis=0))
-        concatenated_bases = []
-        concatenated_activations = []
-        self.dictionary_components = {}
-        self.component_slices = {}
-
-        current_start = 0
-        for appliance_name in appliance_names:
-            reshaped = self._reshape_power(np.concatenate(appliance_series[appliance_name], axis=0))
-            dictionary_model = self._learn_dictionary(reshaped)
-            bases = dictionary_model.components_.T.astype(np.float32)
-            activations = dictionary_model.transform(reshaped.T).T.astype(np.float32)
-            self.dictionary_components[appliance_name] = dictionary_model.components_.astype(np.float32)
-            concatenated_bases.append(bases)
-            concatenated_activations.append(activations)
-            self.component_slices[appliance_name] = (current_start, current_start + self.n_components)
-            current_start += self.n_components
-
-        all_bases = np.concatenate(concatenated_bases, axis=1)
-        all_activations = np.concatenate(concatenated_activations, axis=0)
-        optimal_bases = self._discriminative_training(all_activations, all_bases, total_power)
-
-        self.reconstruction_bases = all_bases.astype(np.float32)
-        self.disaggregation_bases = optimal_bases.astype(np.float32)
-
-    def disaggregate_joint(
-        self,
-        grouped_test_data: dict[str, ClassicalInferenceGroup],
-    ) -> dict[str, pd.DataFrame]:
-        if self.disaggregation_bases is None or self.reconstruction_bases is None:
-            raise RuntimeError("DiscriminativeSparseCoding must be fitted before disaggregation.")
-
-        from sklearn.decomposition import SparseCoder
-
-        coder = SparseCoder(
-            dictionary=self.disaggregation_bases.T,
-            positive_code=True,
-            transform_algorithm="lasso_lars",
-            transform_alpha=self.sparsity_coef,
-        )
-
-        predictions: dict[str, pd.DataFrame] = {}
-        for group_id, group in grouped_test_data.items():
-            reshaped = self._reshape_power(group.aggregate)
-            predicted_activations = coder.transform(reshaped.T).T
-            outputs = {}
-            for appliance_name in self.appliance_order:
-                start, end = self.component_slices[appliance_name]
-                predicted_usage = (
-                    self.reconstruction_bases[:, start:end] @ predicted_activations[start:end, :]
-                ).T.reshape(-1)
-                predicted_usage = predicted_usage[: len(group.aggregate)]
-                outputs[appliance_name] = np.clip(predicted_usage, 0.0, group.aggregate)
-            predictions[group_id] = pd.DataFrame(outputs, dtype="float32")
-        return predictions
-
+    @torch.no_grad()
     def predict(self, inference_data, context: InferenceContext) -> PredictionOutput:
         del context
-        predictions = self.disaggregate_joint(inference_groups(inference_data))
+        if not self.models:
+            raise RuntimeError("DSC must be fitted before prediction.")
+        reconstruction = torch.cat([
+            torch.tensor(m.reconstruction_dictionary, dtype=torch.float32)
+            for m in self.models.values()
+        ], dim=1)
+        discriminative = torch.cat([
+            torch.tensor(m.discriminative_dictionary, dtype=torch.float32)
+            for m in self.models.values()
+        ], dim=1)
         timestamps, households, powers = [], [], []
         for series in inference_data.series:
-            frame = predictions[series.household_id]
+            windows = _windows(series.aggregate, self.window_size)
+            codes = nonnegative_sparse_code(
+                discriminative, windows, sparsity_coefficient=self.sparsity_coef,
+                max_iterations=self.sparse_code_iterations, tolerance=self.tolerance,
+            ).codes
+            outputs, start = [], 0
+            for _name in self.models:
+                stop = start + self.n_components
+                outputs.append((reconstruction[:, start:stop] @ codes[start:stop]).T.flatten()[:len(series.aggregate)])
+                start = stop
+            stacked = torch.stack(outputs).clamp_(min=0)
+            aggregate = torch.as_tensor(series.aggregate, dtype=torch.float32)
+            if self.enforce_aggregate:
+                total = stacked.sum(dim=0)
+                scale = torch.where(total > aggregate, aggregate / total.clamp_min(torch.finfo(total.dtype).eps), torch.ones_like(total))
+                stacked *= scale
             timestamps.append(series.timestamps)
             households.append(np.repeat(series.household_id, len(series.timestamps)))
-            powers.append(frame[list(series.appliances)].to_numpy(dtype=np.float32))
+            powers.append(stacked.T.numpy())
         return PredictionOutput(
-            timestamps=np.concatenate(timestamps),
-            power=np.concatenate(powers),
-            appliances=inference_data.series[0].appliances,
-            household_ids=np.concatenate(households),
+            timestamps=np.concatenate(timestamps), power=np.concatenate(powers),
+            appliances=tuple(self.models), household_ids=np.concatenate(households),
         )
 
     def save(self, path, *, metadata=None) -> None:
-        torch.save(
-            {
-                "model_key": self._registry_key,
-                "init_kwargs": dict(self._config),
-                "model_state": self.get_state(),
-                "metadata": dict(metadata or {}),
-            }, path,
-        )
+        torch.save({
+            "model_key": self._registry_key, "init_kwargs": dict(self._config),
+            "model_state": self.get_state(), "metadata": dict(metadata or {}),
+        }, path)
 
     def load(self, path, device="cpu") -> None:
         try:
@@ -255,23 +388,16 @@ class DiscriminativeSparseCoding:
         self.set_state(checkpoint["model_state"])
 
     def get_state(self) -> dict[str, Any]:
-        return _serialise_value(
-            {
-                "appliance_order": self.appliance_order,
-                "dictionary_components": self.dictionary_components,
-                "reconstruction_bases": self.reconstruction_bases,
-                "disaggregation_bases": self.disaggregation_bases,
-                "component_slices": self.component_slices,
-            }
-        )
+        return _serialise_value({name: asdict(model) for name, model in self.models.items()})
 
     def set_state(self, state: dict[str, Any]) -> None:
         restored = _deserialise_value(state)
-        self.appliance_order = list(restored["appliance_order"])
-        self.dictionary_components = dict(restored["dictionary_components"])
-        self.reconstruction_bases = restored["reconstruction_bases"]
-        self.disaggregation_bases = restored["disaggregation_bases"]
-        self.component_slices = {
-            key: tuple(int(value) for value in values)
-            for key, values in restored["component_slices"].items()
-        }
+        self.models = OrderedDict(
+            (name, _DSCParameters(
+                tuple(tuple(float(x) for x in row) for row in payload["reconstruction_dictionary"]),
+                tuple(tuple(float(x) for x in row) for row in payload["discriminative_dictionary"]),
+                int(payload["training_windows"]), float(payload["reconstruction_objective"]),
+                int(payload["reconstruction_iterations"]), bool(payload["reconstruction_converged"]),
+                float(payload["activation_error"]),
+            )) for name, payload in restored.items()
+        )
