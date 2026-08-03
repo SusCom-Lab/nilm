@@ -74,9 +74,11 @@ class WindowGRUDataset(Dataset):
         max_val: float,
         *,
         include_status: bool = False,
+        domain_mapping: dict[str, int] | None = None,
     ) -> None:
         self.inputs = []
         self.targets = []
+        self.domains = [] if domain_mapping is not None else None
         for series in partition.series:
             if len(series.appliances) != 1:
                 raise ValueError("WindowGRU is a single-appliance model.")
@@ -110,12 +112,18 @@ class WindowGRUDataset(Dataset):
                         )
                     else:
                         self.targets.append(torch.tensor(target, dtype=torch.float32))
+                    if self.domains is not None:
+                        self.domains.append(
+                            torch.tensor(domain_mapping[series.household_id], dtype=torch.long)
+                        )
                 start = end
 
     def __len__(self):
         return len(self.inputs)
 
     def __getitem__(self, index):
+        if self.domains is not None:
+            return self.inputs[index], self.targets[index], self.domains[index]
         return self.inputs[index], self.targets[index]
 
 
@@ -200,12 +208,23 @@ class WindowGRU(RNNBaseline):
             "max_val": self.max_val,
             "appliances": train_data.series[0].appliances,
         }
+        requires_domains = bool(getattr(self, "requires_domain_targets", False))
+        domain_mapping = (
+            {household: index for index, household in enumerate(sorted(train_data.household_ids))}
+            if requires_domains else None
+        )
+        if requires_domains and len(domain_mapping) > int(self.num_domains):
+            raise ValueError(
+                f"{self.display_name} num_domains={self.num_domains} cannot represent "
+                f"{len(domain_mapping)} training households."
+            )
         loader = DataLoader(
             WindowGRUDataset(
                 train_data,
                 self.window_size,
                 self.max_val,
                 include_status=bool(getattr(self, "requires_status_targets", False)),
+                domain_mapping=domain_mapping,
             ),
             batch_size=self.official_batch_size,
             shuffle=True,
@@ -227,13 +246,18 @@ class WindowGRU(RNNBaseline):
         for epoch in range(1, context.num_epochs + 1):
             self.train()
             total = 0.0
-            for inputs, targets in loader:
+            for batch in loader:
+                inputs, targets = batch[:2]
+                house_ids = batch[2] if requires_domains else None
                 optimizer.zero_grad()
                 inputs = inputs.to(context.device)
                 targets = targets.to(context.device)
                 loss_hook = getattr(self, "compute_loss", None)
                 if callable(loss_hook):
-                    loss_result = loss_hook(inputs, targets, criterion=criterion)
+                    loss_kwargs = {"criterion": criterion}
+                    if house_ids is not None:
+                        loss_kwargs["house_ids"] = house_ids.to(context.device)
+                    loss_result = loss_hook(inputs, targets, **loss_kwargs)
                     loss = loss_result[0] if isinstance(loss_result, tuple) else loss_result
                 else:
                     loss = criterion(self(inputs), targets)

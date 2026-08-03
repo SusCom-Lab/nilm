@@ -30,6 +30,7 @@ class StateConditionedInvariantWindowGRU(WindowGRU):
     model_family = "rnn"
     target_type = "point"
     requires_status_targets = True
+    requires_domain_targets = True
     default_window_size = 599
     default_num_epochs = 10
 

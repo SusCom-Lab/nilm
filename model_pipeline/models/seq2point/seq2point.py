@@ -40,11 +40,13 @@ class Seq2PointDataset(Dataset):
         appliance_mean: float,
         appliance_std: float,
         include_status: bool = False,
+        domain_mapping: dict[str, int] | None = None,
     ) -> None:
         if len(partition.series[0].appliances) != 1:
             raise ValueError("Seq2Point is a single-appliance model.")
         self.inputs: list[torch.Tensor] = []
         self.targets: list[torch.Tensor] = []
+        self.domains: list[torch.Tensor] | None = [] if domain_mapping is not None else None
         half = window_size // 2
         for series in partition.series:
             segment_ids = (
@@ -86,12 +88,18 @@ class Seq2PointDataset(Dataset):
                         )
                     else:
                         self.targets.append(torch.tensor(target, dtype=torch.float32))
+                    if self.domains is not None:
+                        self.domains.append(
+                            torch.tensor(domain_mapping[series.household_id], dtype=torch.long)
+                        )
                 start = end
 
     def __len__(self) -> int:
         return len(self.inputs)
 
     def __getitem__(self, index: int):
+        if self.domains is not None:
+            return self.inputs[index], self.targets[index], self.domains[index]
         return self.inputs[index], self.targets[index]
 
 
@@ -205,6 +213,16 @@ class Seq2Point(nn.Module):
                     "appliance_std": stats["appliance_std"],
                 }
             )
+        requires_domains = bool(getattr(self, "requires_domain_targets", False))
+        domain_mapping = (
+            {household: index for index, household in enumerate(sorted(train_data.household_ids))}
+            if requires_domains else None
+        )
+        if requires_domains and len(domain_mapping) > int(self.num_domains):
+            raise ValueError(
+                f"{self.display_name} num_domains={self.num_domains} cannot represent "
+                f"{len(domain_mapping)} training households."
+            )
         dataset = Seq2PointDataset(
             train_data,
             window_size=self.window_size,
@@ -213,6 +231,7 @@ class Seq2Point(nn.Module):
             appliance_mean=stats["appliance_mean"],
             appliance_std=stats["appliance_std"],
             include_status=bool(getattr(self, "requires_status_targets", False)),
+            domain_mapping=domain_mapping,
         )
         generator = torch.Generator().manual_seed(context.seed)
         loader = DataLoader(
@@ -234,13 +253,18 @@ class Seq2Point(nn.Module):
         for epoch in range(1, context.num_epochs + 1):
             self.train()
             total_loss = 0.0
-            for inputs, targets in loader:
+            for batch in loader:
+                inputs, targets = batch[:2]
+                house_ids = batch[2] if requires_domains else None
                 optimizer.zero_grad()
                 inputs = inputs.to(context.device)
                 targets = targets.to(context.device)
                 loss_hook = getattr(self, "compute_loss", None)
                 if callable(loss_hook):
-                    loss_output = loss_hook(inputs, targets, criterion=criterion)
+                    loss_kwargs = {"criterion": criterion}
+                    if house_ids is not None:
+                        loss_kwargs["house_ids"] = house_ids.to(context.device)
+                    loss_output = loss_hook(inputs, targets, **loss_kwargs)
                     loss = loss_output[0] if isinstance(loss_output, tuple) else loss_output
                 else:
                     loss = criterion(self(inputs), self.prepare_targets(targets))
