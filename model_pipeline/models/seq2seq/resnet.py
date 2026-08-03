@@ -19,24 +19,17 @@ class IdentityBlock(nn.Module):
     def __init__(self, filters: tuple[int, int, int], kernel_size: int, input_channels: int | None = None):
         super().__init__()
         in_channels = input_channels if input_channels is not None else filters[0]
-        self.conv1 = nn.Conv1d(in_channels, filters[0], kernel_size, stride=1, padding=kernel_size // 2)
-        self.conv2 = nn.Conv1d(filters[0], filters[1], kernel_size, stride=1, padding=kernel_size // 2)
-        self.conv3 = nn.Conv1d(filters[1], filters[2], kernel_size, stride=1, padding=kernel_size // 2)
-        self.shortcut = (
-            nn.Conv1d(in_channels, filters[2], kernel_size=1, stride=1, padding=0)
-            if in_channels != filters[2]
-            else nn.Identity()
-        )
+        if in_channels != filters[2]:
+            raise ValueError("Official ResNet identity blocks require matching channels.")
+        self.conv1 = nn.Conv1d(in_channels, filters[0], kernel_size, padding="same")
+        self.conv2 = nn.Conv1d(filters[0], filters[1], kernel_size, padding="same")
+        self.conv3 = nn.Conv1d(filters[1], filters[2], kernel_size, padding="same")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = self.shortcut(x)
+        identity = x
         out = F.relu(self.conv1(x))
         out = F.relu(self.conv2(out))
         out = self.conv3(out)
-        if out.size() != identity.size():
-            min_size = min(out.size(2), identity.size(2))
-            out = out[:, :, :min_size]
-            identity = identity[:, :, :min_size]
         return F.relu(out + identity)
 
 
@@ -44,20 +37,16 @@ class ConvolutionBlock(nn.Module):
     def __init__(self, filters: tuple[int, int, int], kernel_size: int, input_channels: int | None = None):
         super().__init__()
         in_channels = input_channels if input_channels is not None else filters[0]
-        self.conv1 = nn.Conv1d(in_channels, filters[0], kernel_size, stride=1, padding=kernel_size // 2)
-        self.conv2 = nn.Conv1d(filters[0], filters[1], kernel_size, stride=1, padding=kernel_size // 2)
-        self.conv3 = nn.Conv1d(filters[1], filters[2], kernel_size, stride=1, padding=kernel_size // 2)
-        self.conv4 = nn.Conv1d(in_channels, filters[2], kernel_size, stride=1, padding=kernel_size // 2)
+        self.conv1 = nn.Conv1d(in_channels, filters[0], kernel_size, padding="same")
+        self.conv2 = nn.Conv1d(filters[0], filters[1], kernel_size, padding="same")
+        self.conv3 = nn.Conv1d(filters[1], filters[2], kernel_size, padding="same")
+        self.conv4 = nn.Conv1d(in_channels, filters[2], kernel_size, padding="same")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = F.relu(self.conv4(x))
+        identity = self.conv4(x)
         out = F.relu(self.conv1(x))
         out = F.relu(self.conv2(out))
-        out = F.relu(self.conv3(out))
-        if out.size() != identity.size():
-            min_size = min(out.size(2), identity.size(2))
-            out = out[:, :, :min_size]
-            identity = identity[:, :, :min_size]
+        out = self.conv3(out)
         return F.relu(out + identity)
 
 
@@ -72,6 +61,7 @@ class ResNetNILM(Seq2SeqCNN):
     official_batch_size = 512
     official_mains_mean = 1800.0
     official_mains_std = 600.0
+    official_gradient_clip_norm = 1.0
 
     def __init__(self, *, window_size: int = 299, num_filters: int = 30, hidden_dim: int = 1024):
         nn.Module.__init__(self)
@@ -96,7 +86,7 @@ class ResNetNILM(Seq2SeqCNN):
 
     def _forward_conv_layers(self, x: torch.Tensor) -> torch.Tensor:
         x = self.zero_pad(x)
-        x = self.conv1(x)
+        x = F.relu(self.conv1(x))
         x = self.bn1(x)
         x = F.relu(x)
         x = self.maxpool(x)

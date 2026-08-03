@@ -83,6 +83,8 @@ class Seq2SeqCNN(nn.Module):
     official_batch_size = 512
     official_mains_mean = 1800.0
     official_mains_std = 600.0
+    official_optimizer_epsilon = 1e-7
+    official_gradient_clip_norm = None
 
     def __init__(self, *, window_size: int = 99, hidden_dim: int = 1024) -> None:
         super().__init__()
@@ -159,7 +161,10 @@ class Seq2SeqCNN(nn.Module):
         )
         self.to(context.device)
         optimizer = torch.optim.Adam(
-            self.parameters(), lr=0.001, betas=(0.9, 0.999), eps=1e-7
+            self.parameters(),
+            lr=0.001,
+            betas=(0.9, 0.999),
+            eps=float(self.official_optimizer_epsilon),
         )
         criterion = nn.MSELoss()
         history = []
@@ -175,6 +180,10 @@ class Seq2SeqCNN(nn.Module):
                     self(inputs.to(context.device)), targets.to(context.device)
                 )
                 loss.backward()
+                if self.official_gradient_clip_norm is not None:
+                    nn.utils.clip_grad_norm_(
+                        self.parameters(), float(self.official_gradient_clip_norm)
+                    )
                 optimizer.step()
                 total += float(loss.item())
             validation = context.validate_candidate(epoch=epoch, model=self)
@@ -195,11 +204,19 @@ class Seq2SeqCNN(nn.Module):
 
     def _predict_segment(self, aggregate, context):
         stats = self.normalization
-        half = self.window_size // 2
-        padded = np.pad(aggregate, (half, half))
-        windows = np.stack(
-            [padded[index : index + self.window_size] for index in range(len(aggregate))]
-        )
+        if len(aggregate) < self.window_size:
+            inference_values = np.pad(
+                aggregate, (0, self.window_size - len(aggregate))
+            )
+            windows = inference_values[None, :]
+        else:
+            inference_values = aggregate
+            windows = np.stack(
+                [
+                    inference_values[index : index + self.window_size]
+                    for index in range(len(inference_values) - self.window_size + 1)
+                ]
+            )
         windows = (windows - stats["mains_mean"]) / stats["mains_std"]
         predicted = []
         with torch.inference_mode():
@@ -212,14 +229,12 @@ class Seq2SeqCNN(nn.Module):
                 predicted.append(self(inputs).cpu().numpy())
         predicted = np.concatenate(predicted)
         predicted = predicted * stats["appliance_std"] + stats["appliance_mean"]
-        sums = np.zeros(len(padded), dtype=np.float64)
-        counts = np.zeros(len(padded), dtype=np.float64)
+        sums = np.zeros(len(inference_values), dtype=np.float64)
+        counts = np.zeros(len(inference_values), dtype=np.float64)
         for index, window in enumerate(predicted):
             sums[index : index + self.window_size] += window
             counts[index : index + self.window_size] += 1
-        return (sums[half : half + len(aggregate)] / counts[half : half + len(aggregate)]).astype(
-            np.float32
-        )
+        return (sums[: len(aggregate)] / counts[: len(aggregate)]).astype(np.float32)
 
     def predict(self, inference_data: InferencePartition, context: InferenceContext):
         if self.normalization is None:
