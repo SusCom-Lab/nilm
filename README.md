@@ -68,27 +68,15 @@ nilm-baseline/
 │       └── schemas.py                    #   Pipeline summary schema
 │
 └── model_pipeline/                       # Model pipeline module
-    ├── __init__.py                        #   Package entry, exports public API
-    ├── model_registry.py                 #   Model registration & checkpoint utilities
-    ├── data_feeder.py                    #   SlidingWindowDataset & series reconstruction
-    ├── train_model.py                    #   Trainer class
-    ├── test_model.py                     #   Evaluator class
-    ├── finetune_model.py                 #   Finetuner class
-    └── models/                           #   Model implementations
-        ├── __init__.py                    #     Auto-imports all model modules
-        ├── base_model.py                 #     BaseNILMModel / TorchNILMModel / ClassicalNILMModel
-        ├── seq2point/
-        │   ├── __init__.py               #     Seq2Point family imports
-        │   ├── cnn.py                    #     Seq2Point (baseline) + Reduced + Balanced
-        │   └── rnn.py                    #     Seq2Point_LSTM + RNN / WindowGRU / BiLSTM
-        ├── seq2seq/
-        │   ├── __init__.py               #     Seq2Seq family imports
-        │   ├── cnn.py                    #     Seq2Seq (baseline)
-        │   └── autoencoder.py            #     DAE (baseline)
-        └── classical/
-            ├── __init__.py               #     Classical family imports
-            ├── afhmm.py                  #     AFHMM (baseline) + AFHMM_SAC (variant)
-            └── dsc.py                    #     DSC (baseline)
+    ├── api.py                             #   Stable plugin input/output contracts
+    ├── data_protocol.py                   #   Explicit household splits and target hiding
+    ├── model_registry.py                  #   Model discovery and checkpoint utilities
+    ├── train_model.py                     #   Public validation-MSE runner and Finetuner adapter
+    ├── test_model.py                      #   Common timeline evaluator
+    └── models/                            #   Self-contained model plugins
+        ├── seq2point/                     #     Point-output CNN/RNN and local variants
+        ├── seq2seq/                       #     Sequence-output CNN/Transformer models
+        └── classical/                     #     AFHMM, AFHMM-SAC and DSC
 ```
 
 ---
@@ -235,7 +223,8 @@ Select option `1`, then follow the prompts:
 - Enter dataset name (e.g., `UKDALE`)
 - Select a model from the list
 - Configure window size and hyperparameters
-- Set number of epochs, validation ratio, and random seed
+- Set model hyperparameter overrides and number of epochs
+- Training runs the fixed seeds `42`, `3407`, and `2026`
 
 **Programmatic usage:**
 
@@ -245,10 +234,10 @@ from model_pipeline import train_model
 trainer = train_model.Trainer(
     model_name="seq2point",
     train_csv_dirs=["path/to/train.csv"],
+    validation_csv_dirs=["path/to/validation.csv"],
     appliance="dishwasher",
     dataset="UKDALE",
     window_length=599,
-    num_epochs=10,
 )
 trainer.trainModel(num_epochs=10)
 trainer.plotLosses()
@@ -276,7 +265,7 @@ evaluator.plotResults()
 - `prediction_plot_<appliance>_<model>.png` — Full timeline plot
 - `zoomed_plot_<appliance>_<model>.png` — Zoomed active region
 - `<appliance>_results.csv` — Predictions vs ground truth
-- `<appliance>_<model>_metrics.csv` — MAE, SAE, inference time
+- `<appliance>_<model>_metrics.csv` — common test metrics and inference time
 
 ### 3. Fine-tune a Model
 
@@ -285,11 +274,12 @@ Select option `3`, then provide a fine-tuning CSV and a pre-trained `.pth` check
 **Programmatic usage:**
 
 ```python
-from model_pipeline import finetune_model
+from model_pipeline import train_model
 
-finetuner = finetune_model.Finetuner(
+finetuner = train_model.Finetuner(
     model_state_dir="saved_models/dishwasher_UKDALE_Seq2Point.pth",
     finetune_csv_dir="path/to/new_data.csv",
+    validation_csv_dirs=["path/to/validation.csv"],
     dataset="UKDALE",
     model_save_dir="saved_models",
 )
@@ -355,33 +345,31 @@ Central registration system using `@register_model` decorator:
 - `load_checkpoint(path)` — Load a `.pth` checkpoint
 - `instantiate_from_checkpoint(checkpoint)` — Reconstruct model from checkpoint
 
-### Data Feeder (`data_feeder.py`)
+### Data Protocol (`data_protocol.py`)
 
-- `SlidingWindowDataset` — PyTorch Dataset that builds sliding windows from CSV files with z-score normalization and train/val splitting
-- `reconstruct_series_from_windows()` — Reconstructs a full time series from overlapping window predictions via averaging
+- Loads explicit training, validation and test households into canonical raw-watt partitions.
+- If training and validation reference the same CSV set, every continuous series is split chronologically 80:20.
+- Validation/test labels are hidden before calling a model plugin.
 
 ### Trainer (`train_model.py`)
 
-- Adam optimizer with ReduceLROnPlateau scheduler
-- Early stopping (patience=8)
-- Saves best checkpoint (model state + metadata)
-- Supports both gradient-based (PyTorch) and classical (sklearn-style `fit`) models
-- Loss plotting
+- Runs fixed household splits and seeds; it does not own model optimizers or losses.
+- Selects every model's checkpoint using the same raw-watt validation MSE.
+- Keeps checkpoints under `saved_models/` and training plots/history under `result/`.
+- Calls each plugin's private `fit()` and `predict()` implementation.
 
 ### Evaluator (`test_model.py`)
 
-- Computes MAE and SAE metrics
-- Denormalizes predictions back to Watts
-- Reconstructs full series from windowed output
+- Computes MAE, SAE, Precision, Recall, F1, MAE-on and MAE-off.
+- Requires every plugin to return raw watts on the complete canonical time axis.
 - Clips predictions to `[0, aggregate]`
 - Auto-detects active region for zoomed plot
 - Exports results CSV and metrics CSV
 
-### Finetuner (`finetune_model.py`)
+### Finetuner (`train_model.py`)
 
-- Loads checkpoint and freezes all layers except `nn.Linear`
-- Trains with no validation split (full data for adaptation)
-- Supports gradient-based models only
+- Loads a checkpoint and reuses that model plugin's own training logic.
+- Requires separately selected validation households and the same public validation-MSE rule.
 
 ---
 
