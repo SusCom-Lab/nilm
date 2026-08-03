@@ -75,6 +75,7 @@ class SGN(Seq2Point):
     default_num_epochs = 10
     official_batch_size = 16
     official_learning_rate = 1e-4
+    requires_status_targets = True
 
     def __init__(
         self,
@@ -161,9 +162,10 @@ class SGN(Seq2Point):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         gated, _, logits = self.training_outputs(inputs)
         prepared_outputs = self.prepare_outputs(gated)
-        prepared_targets = super().prepare_targets(targets)
-        raw_targets = prepared_targets * self.target_std + self.target_mean
-        on_targets = (raw_targets > self.on_power_threshold).to(logits.dtype)
+        if targets.ndim != 2 or targets.size(-1) != 2:
+            raise ValueError("SGN requires public power and status targets.")
+        prepared_targets = super().prepare_targets(targets[:, 0])
+        on_targets = super().prepare_targets(targets[:, 1]).to(logits.dtype)
         output_loss = criterion(prepared_outputs, prepared_targets)
         classification_loss = F.binary_cross_entropy_with_logits(
             logits.reshape(-1), on_targets.reshape(-1)
@@ -177,7 +179,8 @@ class SGN(Seq2Point):
         criterion,
     ) -> torch.Tensor:
         outputs = self.prepare_outputs(self(inputs))
-        return criterion(outputs, super().prepare_targets(targets))
+        power_targets = targets[:, 0] if targets.ndim == 2 else targets
+        return criterion(outputs, super().prepare_targets(power_targets))
 
 
 __all__ = [

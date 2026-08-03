@@ -1,56 +1,270 @@
-"""
-Point-output GRU baseline for NILM.
+"""Official WindowGRU PyTorch plugin.
 
-Official source: https://github.com/nilmtk/nilmtk-contrib/blob/14efd545e09d836e02159b23444350af92c6ee70/nilmtk_contrib/torch/WindowGRU.py
-Local adaptation: point-output registry and plugin interfaces.
+Official repository: https://github.com/nilmtk/nilmtk-contrib
+Official revision: 14efd545e09d836e02159b23444350af92c6ee70
+Official file: nilmtk_contrib/torch/WindowGRU.py
+Local adaptations: canonical partitions, public validation MSE, complete raw-watt
+timeline output, and repository checkpoint metadata.
 """
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 
+from model_pipeline.api import (
+    FitResult,
+    InferenceContext,
+    PredictionOutput,
+    TrainingContext,
+)
 from model_pipeline.model_registry import register_model
 from model_pipeline.models.seq2point.rnn import RNNBaseline
+
+
+class FastReLUGRU(nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        *,
+        batch_first: bool = True,
+        bidirectional: bool = False,
+        return_sequences: bool = True,
+    ) -> None:
+        super().__init__()
+        self.return_sequences = return_sequences
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            batch_first=batch_first,
+            bidirectional=bidirectional,
+        )
+        output_size = hidden_size * 2 if bidirectional else hidden_size
+        self.activation_transform = nn.Sequential(
+            nn.Linear(output_size, output_size),
+            nn.ReLU(),
+            nn.Linear(output_size, output_size),
+        )
+
+    def forward(self, inputs, hidden=None):
+        if self.return_sequences:
+            output, final_hidden = self.gru(inputs, hidden)
+            shape = output.shape
+            output = self.activation_transform(output.reshape(-1, shape[-1]))
+            return output.reshape(shape), final_hidden
+        _, final_hidden = self.gru(inputs, hidden)
+        if final_hidden.dim() == 3:
+            if final_hidden.size(0) == 2:
+                final_hidden = torch.cat((final_hidden[0], final_hidden[1]), dim=1)
+            else:
+                final_hidden = final_hidden.squeeze(0)
+        return None, self.activation_transform(final_hidden)
+
+
+class WindowGRUDataset(Dataset):
+    """Official forward-looking windows with end padding and scalar targets."""
+
+    def __init__(self, partition, window_size: int, max_val: float) -> None:
+        self.inputs = []
+        self.targets = []
+        for series in partition.series:
+            if len(series.appliances) != 1:
+                raise ValueError("WindowGRU is a single-appliance model.")
+            segments = series.segment_ids
+            if segments is None:
+                segments = np.zeros(len(series.aggregate), dtype=np.int64)
+            start = 0
+            while start < len(series.aggregate):
+                end = start + 1
+                while end < len(series.aggregate) and segments[end] == segments[start]:
+                    end += 1
+                aggregate = np.pad(
+                    series.aggregate[start:end], (0, window_size - 1)
+                )
+                for index in range(end - start):
+                    self.inputs.append(
+                        torch.as_tensor(
+                            aggregate[index : index + window_size] / max_val,
+                            dtype=torch.float32,
+                        )
+                    )
+                    self.targets.append(
+                        torch.tensor(
+                            series.appliance_power[start + index, 0] / max_val,
+                            dtype=torch.float32,
+                        )
+                    )
+                start = end
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, index):
+        return self.inputs[index], self.targets[index]
 
 
 @register_model("window_gru", aliases=("WindowGRU",), display_name="WindowGRU")
 class WindowGRU(RNNBaseline):
     display_name = "WindowGRU"
     model_family = "rnn"
-
-    default_window_size = 19
+    target_type = "point"
+    default_window_size = 99
     default_num_epochs = 10
     official_batch_size = 512
 
-    def __init__(self, *, window_size: int = 19):
+    def __init__(self, *, window_size: int = 99, max_val: float = 800.0):
         nn.Module.__init__(self)
-        if window_size < 2:
-            raise ValueError("WindowGRU window_size must be at least 2.")
-        self.window_size = window_size
+        if window_size < 2 or max_val <= 0:
+            raise ValueError("WindowGRU window_size and max_val must be positive.")
+        self.window_size = int(window_size)
         self.output_size = 1
-        self.output_offset = window_size // 2
-        self._config = {"window_size": window_size}
+        self.output_offset = 0
+        self.max_val = float(max_val)
+        self._config = {"window_size": self.window_size, "max_val": self.max_val}
         self.normalization = None
-        self.conv1 = nn.Conv1d(1, 16, kernel_size=4, padding=2)
-        self.gru1 = nn.GRU(16, 64, batch_first=True, bidirectional=True)
+        self.conv1 = nn.Conv1d(1, 16, kernel_size=4, padding=2, stride=1)
+        self.gru1 = FastReLUGRU(
+            16, 64, batch_first=True, bidirectional=True, return_sequences=True
+        )
         self.dropout1 = nn.Dropout(0.5)
-        self.gru2 = nn.GRU(128, 128, batch_first=True, bidirectional=True)
+        self.gru2 = FastReLUGRU(
+            128, 128, batch_first=True, bidirectional=True, return_sequences=False
+        )
         self.dropout2 = nn.Dropout(0.5)
         self.fc1 = nn.Linear(256, 128)
         self.dropout3 = nn.Dropout(0.5)
         self.fc2 = nn.Linear(128, 1)
+        self._initialize_weights()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.unsqueeze(1)
-        x = torch.relu(self.conv1(x))
-        x = x.permute(0, 2, 1)
-        x, _ = self.gru1(x)
-        x = self.dropout1(x)
-        _, hidden = self.gru2(x)
-        x = torch.cat([hidden[-2], hidden[-1]], dim=1)
-        x = self.dropout2(x)
-        x = self.fc1(x)
-        x = torch.relu(x)
-        x = self.dropout3(x)
-        return self.fc2(x).reshape(-1)
+    def _initialize_weights(self):
+        for name, parameter in self.named_parameters():
+            if "weight_ih" in name or "weight_hh" in name:
+                nn.init.xavier_uniform_(parameter)
+            elif "bias_ih" in name or "bias_hh" in name:
+                nn.init.zeros_(parameter)
+            elif "activation_transform" in name and "weight" in name:
+                nn.init.xavier_uniform_(parameter)
+            elif "activation_transform" in name and "bias" in name:
+                nn.init.zeros_(parameter)
+            elif "weight" in name and "conv1" in name:
+                nn.init.xavier_uniform_(parameter)
+            elif "bias" in name and "conv1" in name:
+                nn.init.zeros_(parameter)
+            elif "fc" in name and "weight" in name:
+                nn.init.xavier_uniform_(parameter)
+            elif "fc" in name and "bias" in name:
+                nn.init.zeros_(parameter)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if inputs.ndim == 2:
+            inputs = inputs.unsqueeze(1)
+        encoded = torch.relu(self.conv1(inputs)).permute(0, 2, 1)
+        encoded, _ = self.gru1(encoded)
+        encoded = self.dropout1(encoded)
+        _, hidden = self.gru2(encoded)
+        hidden = self.dropout2(hidden)
+        hidden = self.dropout3(torch.relu(self.fc1(hidden)))
+        return self.fc2(hidden).reshape(-1)
+
+    def fit(self, train_data, validation_data, context: TrainingContext) -> FitResult:
+        del validation_data
+        self.normalization = {
+            "max_val": self.max_val,
+            "appliances": train_data.series[0].appliances,
+        }
+        loader = DataLoader(
+            WindowGRUDataset(train_data, self.window_size, self.max_val),
+            batch_size=self.official_batch_size,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(context.seed),
+        )
+        self.to(context.device)
+        optimizer = torch.optim.Adam(
+            self.parameters(),
+            lr=0.001,
+            betas=(0.9, 0.999),
+            eps=1e-7,
+            weight_decay=0.0,
+        )
+        criterion = nn.MSELoss()
+        history = []
+        best_epoch = None
+        best_mse = None
+        checkpoint_path = None
+        for epoch in range(1, context.num_epochs + 1):
+            self.train()
+            total = 0.0
+            for inputs, targets in loader:
+                optimizer.zero_grad()
+                outputs = self(inputs.to(context.device))
+                loss = criterion(outputs, targets.to(context.device))
+                loss.backward()
+                optimizer.step()
+                total += float(loss.item())
+            validation = context.validate_candidate(epoch=epoch, model=self)
+            history.append(
+                {
+                    "epoch": epoch,
+                    "training_loss": total / max(1, len(loader)),
+                    "validation_mse": validation.mse,
+                }
+            )
+            if validation.improved:
+                best_epoch = epoch
+                best_mse = validation.mse
+                checkpoint_path = validation.checkpoint_path
+            if validation.should_stop:
+                break
+        return FitResult(history, best_epoch, best_mse, checkpoint_path)
+
+    def predict(self, inference_data, context: InferenceContext) -> PredictionOutput:
+        if self.normalization is None:
+            raise RuntimeError("WindowGRU must be fitted or loaded before prediction.")
+        self.to(context.device)
+        self.eval()
+        timestamps, households, predictions = [], [], []
+        with torch.inference_mode():
+            for series in inference_data.series:
+                segments = series.segment_ids
+                if segments is None:
+                    segments = np.zeros(len(series.aggregate), dtype=np.int64)
+                output = np.empty(len(series.aggregate), dtype=np.float32)
+                start = 0
+                while start < len(series.aggregate):
+                    end = start + 1
+                    while end < len(series.aggregate) and segments[end] == segments[start]:
+                        end += 1
+                    aggregate = np.pad(
+                        series.aggregate[start:end], (0, self.window_size - 1)
+                    )
+                    windows = np.stack(
+                        [
+                            aggregate[index : index + self.window_size]
+                            for index in range(end - start)
+                        ]
+                    ) / self.max_val
+                    batches = []
+                    for offset in range(0, len(windows), context.batch_size):
+                        inputs = torch.as_tensor(
+                            windows[offset : offset + context.batch_size],
+                            dtype=torch.float32,
+                            device=context.device,
+                        )
+                        batches.append(self(inputs).cpu().numpy())
+                    output[start:end] = np.concatenate(batches) * self.max_val
+                    start = end
+                timestamps.append(series.timestamps)
+                households.append(np.repeat(series.household_id, len(series.timestamps)))
+                predictions.append(output[:, None])
+        return PredictionOutput(
+            np.concatenate(timestamps),
+            np.concatenate(predictions),
+            tuple(self.normalization["appliances"]),
+            np.concatenate(households),
+        )
+
+
+__all__ = ["FastReLUGRU", "WindowGRU", "WindowGRUDataset"]

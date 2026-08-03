@@ -74,6 +74,8 @@ class RNNBaseline(nn.Module):
     default_window_size = 19
     default_num_epochs = 10
     official_batch_size = 512
+    official_optimizer_epsilon = 1e-7
+    official_gradient_clip_norm = None
 
     def __init__(self, *, window_size: int = 19):
         super().__init__()
@@ -89,16 +91,28 @@ class RNNBaseline(nn.Module):
         self.lstm2 = nn.LSTM(256, 256, batch_first=True, bidirectional=True)
         self.fc1 = nn.Linear(512, 128)
         self.fc2 = nn.Linear(128, 1)
-        self.dropout = nn.Dropout(0.1)
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for module in self.modules():
+            if isinstance(module, (nn.Conv1d, nn.Linear)):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LSTM):
+                for name, parameter in module.named_parameters():
+                    if "weight" in name:
+                        nn.init.xavier_uniform_(parameter)
+                    elif "bias" in name:
+                        nn.init.zeros_(parameter)
 
     def forward(self, inputs):
         inputs = inputs.unsqueeze(1)
         inputs = self.conv1d(inputs).permute(0, 2, 1)
         inputs, _ = self.lstm1(inputs)
-        inputs = self.dropout(inputs)
         inputs, _ = self.lstm2(inputs)
         inputs = torch.tanh(self.fc1(inputs[:, -1, :]))
-        return self.fc2(self.dropout(inputs)).reshape(-1)
+        return self.fc2(inputs).reshape(-1)
 
     def _set_normalization(self, train_data):
         targets = np.concatenate([item.appliance_power[:, 0] for item in train_data.series])
@@ -124,7 +138,10 @@ class RNNBaseline(nn.Module):
         )
         self.to(context.device)
         optimizer = torch.optim.Adam(
-            self.parameters(), lr=0.001, betas=(0.9, 0.999), eps=1e-7
+            self.parameters(),
+            lr=0.001,
+            betas=(0.9, 0.999),
+            eps=float(self.official_optimizer_epsilon),
         )
         criterion = nn.MSELoss()
         history = []
@@ -138,6 +155,10 @@ class RNNBaseline(nn.Module):
                 optimizer.zero_grad()
                 loss = criterion(self(inputs.to(context.device)), targets.to(context.device))
                 loss.backward()
+                if self.official_gradient_clip_norm is not None:
+                    nn.utils.clip_grad_norm_(
+                        self.parameters(), float(self.official_gradient_clip_norm)
+                    )
                 optimizer.step()
                 total += float(loss.item())
             validation = context.validate_candidate(epoch=epoch, model=self)
